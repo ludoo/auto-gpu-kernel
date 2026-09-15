@@ -17,8 +17,10 @@ Ranked #1 on [MLSys 2026 - FlashInfer AI Kernel Generation Contest](https://mlsy
 
 ## Install
 
-You need Python 3.11+, [uv](https://docs.astral.sh/uv/), and
-[OMP](https://github.com/can1357/oh-my-pi).
+You need Python 3.11+, [uv](https://docs.astral.sh/uv/), and a coding agent: either
+[OMP](https://github.com/can1357/oh-my-pi) (the default) or
+[pi](https://github.com/badlogic/pi-mono) (see [Run with pi](#run-with-pi); no Python
+extra needed, only the `pi` binary on PATH).
 
 ```bash
 uv venv --python 3.12
@@ -148,6 +150,59 @@ kbench bench --quick            # quick validation + quick measurement
 kbench bench                    # full validation + metric of record
 kbench ab --a <git-ref>         # same current harness for A and B
 ```
+
+## Run with pi
+
+The loop talks to the agent through a small backend interface (`kopt/agent.py`). The
+pi backend drives `pi --mode rpc` directly and needs nothing beyond the `pi` binary.
+Choose it at scaffold time; the choice lands in an `[agent]` table in the project's
+`config.toml`, which `kopt run` reads.
+
+```bash
+kopt init-task task.toml --agent pi \
+  --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth \
+  --extension /path/to/pi-extensions/background-task
+kopt run work/my-project -n 20 --model anthropic/claude-opus-5 --thinking low
+```
+
+`kopt init` takes the same flags. The generated `[agent]` table:
+
+```toml
+[agent]
+kind = "pi"                    # omp | pi
+extensions = ["..."]           # the complete set pi loads; discovery is off
+exclude_tools = ["agy_run", "agy_status", "web_search", "cloxy_fetch", "cloxy_ingest"]
+```
+
+What the pi backend does differently from omp:
+
+- Launches `pi --mode rpc --approve --no-extensions --no-skills --skill .pi/skills`
+  plus one `--extension` per entry, so the project's `.pi/` is the whole surface
+  regardless of the user's global pi setup. `exclude_tools` is the pi form of omp's
+  deny list in `config.yml`; there is no approval layer to configure because pi has
+  none. Put an auth extension in `extensions` if your provider needs one, and the
+  subagent extension if the skills are to delegate to `profiler` and `research`.
+- Scaffolds `AGENTS.md` at the project root (pi reads it from the working directory)
+  and `.pi/skills/`, `.pi/subagents/` instead of `.omp/`. The omp `agents/*.md` become
+  subagent definitions, and `AGENTS.md` gains a table naming them, because the pi
+  subagent tool does not advertise definitions to the model.
+- Extension UI requests are answered headlessly: confirm is `false`, select/input/
+  editor are cancelled.
+- `--max-time` is omp-only; use `--timeout` for the per-turn wall clock.
+
+Skills are copied into the project when it is scaffolded. To pick up a later change to
+`kopt/assets/`, copy the skill into `work/<project>/.pi/skills/` (or `.omp/skills/`)
+by hand or re-scaffold with `--force`.
+
+`kbench` runs the generated harness scripts with its own interpreter; the target's
+environment is whatever `task.path_prepend` puts first on `PATH`. Point it at a venv
+that has the target's dependencies (for `examples/torch-attention`: a CUDA torch,
+triton, pytest). `configs/torch_attention.toml` is the CUDA twin of the MLX example
+for a local NVIDIA GPU.
+
+Do not commit to this checkout while a task-mode setup turn is running: the setup
+step fingerprints the auto-gpu-kernel source tree before and after the turn and
+aborts on any difference, including your own commits.
 
 ## Watch a run
 
