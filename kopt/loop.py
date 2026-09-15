@@ -1,6 +1,6 @@
-"""Drive omp through repeated optimization iterations.
+"""Drive a coding agent through repeated optimization iterations.
 
-One `omp` process, one prompt per iteration. The loop owns the stopping rules the agent
+One agent process, one prompt per iteration. The loop owns the stopping rules the agent
 cannot be trusted to enforce on itself: spend, iteration count, and whether anything
 actually happened.
 """
@@ -10,10 +10,8 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
 
-from omp_rpc import RpcClient
-
+from kopt.agent import AgentBackend, make_backend
 from kopt.record import Recorder, new_run_log
 
 DEFAULT_PROMPT = "/skill:optimize"
@@ -55,17 +53,23 @@ class Loop:
     budget: float | None = None
     """Hard spend cap in USD, checked between iterations."""
     max_time: str | None = None
-    """Per-iteration wall clock passed to omp, e.g. "20m"."""
+    """Per-iteration wall clock passed to omp, e.g. "20m". omp only."""
     timeout: float = 3600.0
     """Seconds to wait for one turn. omp-rpc defaults to 30s, which no real
     optimization iteration finishes inside."""
     model: str | None = None
     thinking: str | None = None
-    """omp thinking level: off|minimal|low|medium|high|xhigh|max."""
+    """Thinking level: off|minimal|low|medium|high|xhigh|max."""
     fresh: bool = False
-    """Start a new omp session each iteration instead of persisting one."""
+    """Start a new session each iteration instead of persisting one."""
+    agent: str = "omp"
+    """Which backend runs the turns: omp | pi. See `kopt.agent`."""
+    extensions: tuple[str, ...] = ()
+    """pi only: the complete extension set to load (discovery is off)."""
+    exclude_tools: tuple[str, ...] = ()
+    """pi only: tool names to disable."""
     history: list[Iteration] = field(default_factory=list)
-    _client: Any = field(default=None, init=False, repr=False)
+    _client: AgentBackend | None = field(default=None, init=False, repr=False)
     _base: tuple[float, int, int] = field(default=(0.0, 0, 0), init=False, repr=False)
     """Cumulative session (cost, tokens, tool_calls) at the start of the current turn."""
 
@@ -109,30 +113,28 @@ class Loop:
 
     # --- main -----------------------------------------------------------
     def _connect(self, log: Recorder):
-        """Open an omp session. Sessions persist across iterations by default so the
+        """Open an agent session. Sessions persist across iterations by default so the
         agent keeps its recent experiments in context — `summary.md` is a lossy
         summary of what it just did, and the detail that didn't make the row is
         often what matters next."""
-        extra = ["--max-time", self.max_time] if self.max_time else []
-        client = RpcClient(
+        client = make_backend(
+            self.agent,
             cwd=str(self.project),
             model=self.model,
             thinking=self.thinking,
-            extra_args=tuple(extra),
             request_timeout=self.timeout,
-            # The default 10k-event ring is smaller than one verbose turn
-            # (high-thinking iterations stream 10M+ tokens); overflow makes
-            # prompt_and_wait lose agent_end and raises RpcError mid-run.
-            max_event_history=None,
-        ).start()  # spawns the process; RpcClient() alone does not
-        client.install_headless_ui()
+            max_time=self.max_time,
+            extensions=self.extensions,
+            exclude_tools=self.exclude_tools,
+        ).start()  # spawns the process
         log.attach(client)
         state = client.get_state()
         stats = client.get_session_stats()
-        print(f"omp session {state.session_id} | model {state.model.id}")
-        log.write("session_start", session_id=state.session_id, model=state.model.id)
+        print(f"{self.agent} session {state.session_id} | model {state.model_id}")
+        log.write("session_start", agent=self.agent, session_id=state.session_id,
+                  model=state.model_id)
         self._client = client
-        self._base = (stats.cost, stats.tokens.total, stats.tool_calls)
+        self._base = (stats.cost, stats.tokens, stats.tool_calls)
         return client
 
     def _turn(self, idx: int, log: Recorder, prompt: str) -> Iteration:
@@ -146,29 +148,30 @@ class Loop:
         # Stats are cumulative for the session; diff against the last turn.
         stats = client.get_session_stats()
         cost, tokens, calls = self._base
-        self._base = (stats.cost, stats.tokens.total, stats.tool_calls)
+        self._base = (stats.cost, stats.tokens, stats.tool_calls)
         logged = sorted(self._logged() - before)
         return Iteration(
             idx=idx,
             experiment=logged[-1] if logged else None,
             benchmarks=max(0, self._benchmarks() - benchmarks_before),
             cost=stats.cost - cost,
-            tokens=stats.tokens.total - tokens,
+            tokens=stats.tokens - tokens,
             tool_calls=stats.tool_calls - calls,
             seconds=elapsed,
-            assistant_text=turn.assistant_text or "",
+            assistant_text=turn.assistant_text,
         )
 
     @staticmethod
     def _is_dead(it: Iteration) -> bool:
         """A turn that returns instantly having spent nothing means the session is
-        gone — `--max-time` expired, or omp exited. Not a lazy agent."""
+        gone — `--max-time` expired, or the agent exited. Not a lazy agent."""
         return it.seconds < 5 and it.cost == 0 and it.tool_calls == 0
 
     def run(self) -> list[Iteration]:
         log = Recorder(new_run_log(self.project))
         print(f"run log: {log.path}")
-        log.write("run_start", project=str(self.project), model=self.model or "(default)",
+        log.write("run_start", project=str(self.project), agent=self.agent,
+                  model=self.model or "(default)",
                   thinking=self.thinking or "(default)", max_iterations=self.max_iterations,
                   budget=self.budget, fresh=self.fresh)
         try:
@@ -204,7 +207,7 @@ class Loop:
                     it = self._turn(idx, log, prompt)
                     it.recovery = prompt == LOG_PROMPT
                     if self._is_dead(it):
-                        raise SystemExit("omp unusable after reconnect")
+                        raise SystemExit(f"{self.agent} unusable after reconnect")
 
                 self.history.append(it)
                 log.write("iteration", spent=self.spent, **asdict(it))

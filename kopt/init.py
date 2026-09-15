@@ -9,9 +9,13 @@ because a wrong shape in AGENTS.md misleads the agent for an entire run.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
+
+from kopt.agent import BACKENDS
 
 ASSETS = Path(__file__).parent / "assets"
 GIT_IDENT = ["-c", "user.email=kopt@localhost", "-c", "user.name=kopt"]
@@ -140,6 +144,118 @@ profile_baseline = false
 """
 
 
+# --- agent home -------------------------------------------------------------
+
+AGENT_CONFIG = """
+[agent]
+kind = "{kind}"   # omp | pi
+# pi only: the complete extension set the loop loads (discovery is off). Paths, ~ ok.
+extensions = {extensions}
+# pi only: tools to disable. Mirrors the omp deny list: no web, no delegation to
+# web-capable agents, nothing that would block a headless run.
+exclude_tools = ["agy_run", "agy_status", "web_search", "cloxy_fetch", "cloxy_ingest"]
+"""
+
+
+def agent_config_toml(kind: str, extensions: tuple[str, ...]) -> str:
+    return AGENT_CONFIG.format(kind=kind, extensions=json.dumps(list(extensions)))
+
+
+def _for_agent(text: str, kind: str) -> str:
+    """Retarget shared prose that names the omp home directory."""
+    if kind == "omp":
+        return text
+    return re.sub(r"\.omp(?![\w-])", ".pi", text.replace(".omp/AGENTS.md", "AGENTS.md"))
+
+
+def _omp_agent_to_pi_subagent(text: str) -> str:
+    """omp `agents/x.md` (name/description/systemPrompt frontmatter) to a pi subagent
+    definition: frontmatter for the runner, the system prompt as the body."""
+    lines = text.splitlines()
+    assert lines and lines[0].strip() == "---", "agent file must start with frontmatter"
+    name = description = ""
+    prompt: list[str] = []
+    in_prompt = False
+    end = len(lines)
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end = i
+            break
+        if in_prompt:
+            if line.startswith("  ") or not line.strip():
+                prompt.append(line)
+                continue
+            in_prompt = False
+        if line.startswith("name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("description:"):
+            description = line.split(":", 1)[1].strip()
+        elif line.startswith("systemPrompt:"):
+            in_prompt = True
+    body = textwrap.dedent("\n".join(prompt)).strip() + "\n"
+    trailing = "\n".join(lines[end + 1:]).strip()
+    if trailing:
+        body += "\n" + trailing + "\n"
+    return (
+        "---\n"
+        f"label: {name}\n"
+        "mode: rpc\n"
+        "---\n"
+        f"{description}\n\n"
+        f"{body}"
+    )
+
+
+def _pi_subagents_section(agents_dir: Path) -> str:
+    """Our subagent extension does not advertise definitions to the model; the
+    instructions have to name them."""
+    rows = []
+    for f in sorted(agents_dir.glob("*.md")):
+        desc = ""
+        for line in f.read_text().splitlines():
+            if line.startswith("description:"):
+                desc = line.split(":", 1)[1].strip()
+                break
+        rows.append(f"| `{f.stem}` | {desc} |")
+    return (
+        "## Subagents\n\n"
+        "Delegate with the `subagent` tool: `subagent(agent=\"<name>\", prompt=\"...\")`."
+        " Definitions live in `.pi/subagents/`. You are notified when one settles;"
+        " do not poll.\n\n"
+        "| name | when |\n|---|---|\n" + "\n".join(rows) + "\n"
+    )
+
+
+def _agent_home(project: Path, kind: str, agents_md: str, assets: Path) -> None:
+    """Write the agent's project-local instructions, skills and helper agents.
+
+    omp reads `.omp/{AGENTS.md,config.yml,skills,agents}`. pi reads `AGENTS.md` at the
+    project root and `.pi/{skills,subagents}`; tool gating is by extension list on the
+    command line, so there is no config file.
+    """
+    if kind not in BACKENDS:
+        raise SystemExit(f"unknown agent {kind!r}; have: {', '.join(BACKENDS)}")
+    if kind == "omp":
+        home = project / ".omp"
+        home.mkdir(exist_ok=True)
+        (home / "AGENTS.md").write_text(agents_md)
+        shutil.copy(ASSETS / "config.yml", home / "config.yml")
+        for sub in ("skills", "agents"):
+            shutil.copytree(assets / sub, home / sub, dirs_exist_ok=True)
+        return
+
+    home = project / ".pi"
+    (home / "subagents").mkdir(parents=True, exist_ok=True)
+    (project / "AGENTS.md").write_text(
+        _for_agent(agents_md, kind).rstrip() + "\n\n" + _pi_subagents_section(assets / "agents")
+    )
+    shutil.copytree(assets / "skills", home / "skills", dirs_exist_ok=True)
+    for skill in (home / "skills").rglob("SKILL.md"):
+        skill.write_text(_for_agent(skill.read_text(), kind))
+    for agent in (assets / "agents").glob("*.md"):
+        (home / "subagents" / agent.name).write_text(_omp_agent_to_pi_subagent(agent.read_text()))
+
+
 def _git_init(project: Path, ignore: str) -> None:
     """Make the project its own repo.
 
@@ -192,7 +308,13 @@ def _copy_local_repo(source: Path, work: Path) -> None:
         _run_git(cmd, work)
 
 
-def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
+def init_task(
+    project: Path,
+    taskspec: Path,
+    force: bool = False,
+    agent: str = "omp",
+    extensions: tuple[str, ...] = (),
+) -> Path:
     """Create an isolated task project from a short, human-authored brief.
 
     The target repository is cloned below the project. A first agent turn later reads
@@ -216,7 +338,13 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
         raise SystemExit(f"{project} exists and is not empty (use --force)")
 
     spec_text = Path(taskspec).read_text()
-    cfg = _load_task(project, tomllib.loads(spec_text))  # validate before touching disk
+    raw = tomllib.loads(spec_text)
+    cfg = _load_task(project, raw)  # validate before touching disk
+    if "agent" in raw:
+        # The brief already chooses; the CLI flags are defaults, not overrides.
+        agent = raw["agent"].get("kind", agent)
+    else:
+        spec_text = spec_text.rstrip() + "\n" + agent_config_toml(agent, extensions)
     project.mkdir(parents=True, exist_ok=True)
     (project / "config.toml").write_text(spec_text)
 
@@ -253,8 +381,6 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
     )
 
     # --- agent home --------------------------------------------------------
-    omp = project / ".omp"
-    omp.mkdir(exist_ok=True)
     origin = (
         "local snapshot, no remote — commit but never push"
         if cfg.repo_path
@@ -270,16 +396,16 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
         f"### How to validate\n\n{cfg.validate}\n\n"
         f"### Hints\n\n{cfg.hints or 'None supplied.'}\n"
     )
-    (omp / "AGENTS.md").write_text(
+    _agent_home(
+        project,
+        agent,
         (ASSETS / "task" / "bootstrap.md").read_text().rstrip()
         + "\n\n"
         + (ASSETS / "task" / "core.md").read_text().rstrip()
         + "\n\n"
-        + task_section
+        + task_section,
+        ASSETS / "task",
     )
-    shutil.copy(ASSETS / "config.yml", omp / "config.yml")
-    for kind in ("skills", "agents"):
-        shutil.copytree(ASSETS / "task" / kind, omp / kind, dirs_exist_ok=True)
 
     # Project-level repo owns the generated harness and experiment history. The target
     # clone is ignored and manages its own commits independently.
@@ -294,6 +420,8 @@ def init(
     backend: str = "modal",
     gpu: str = "B200",
     force: bool = False,
+    agent: str = "omp",
+    extensions: tuple[str, ...] = (),
 ) -> Path:
     if language not in languages():
         raise SystemExit(f"unknown language {language!r}; have: {', '.join(languages())}")
@@ -307,10 +435,8 @@ def init(
     build_language, source_dir = BUILD.get(language, (language, language))
     kernel_file, baseline_file = "solution_fused.py", "solution_baseline.py"
 
-    omp = project / ".omp"
     src = project / "solution" / source_dir
-    for d in (omp, src):
-        d.mkdir(parents=True, exist_ok=True)
+    src.mkdir(parents=True, exist_ok=True)
     _seed_experiments(
         project,
         "| Exp | Date | Description | Latency | Ref | Pass | Backend | Notes |\n"
@@ -318,17 +444,16 @@ def init(
     )
 
     # AGENTS.md = generic core + language profile + generated kernel facts
-    (omp / "AGENTS.md").write_text(
+    _agent_home(
+        project,
+        agent,
         (ASSETS / "core.md").read_text().rstrip()
         + "\n\n"
         + (ASSETS / "lang" / f"{language}.md").read_text().rstrip()
         + "\n\n"
-        + _kernel_section(defn, source_dir, kernel_file, baseline_file)
+        + _kernel_section(defn, source_dir, kernel_file, baseline_file),
+        ASSETS,
     )
-
-    shutil.copy(ASSETS / "config.yml", omp / "config.yml")
-    for kind in ("skills", "agents"):
-        shutil.copytree(ASSETS / kind, omp / kind, dirs_exist_ok=True)
 
     (src / baseline_file).write_text(defn["reference"])
     (src / kernel_file).write_text(_stub(defn))
@@ -348,6 +473,7 @@ def init(
             backend=backend,
             gpu=gpu,
         )
+        + agent_config_toml(agent, extensions)
     )
     _git_init(project, ignore="results.json\n")
     return project

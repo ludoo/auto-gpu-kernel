@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from kbench import config as bench_config
 from kbench import task as taskmod
 from kbench.adapters.base import RunRequest
 from kbench.config import TaskConfig
+from kopt.agent import BACKENDS, load_agent_config
 from kopt.init import GIT_IDENT, init, init_task, languages
 from kopt.loop import DEFAULT_PROMPT, Loop
 from kopt.record import list_run_logs
@@ -35,9 +37,11 @@ def cmd_init(args) -> int:
         backend=args.backend,
         gpu=args.gpu,
         force=args.force,
+        agent=args.agent,
+        extensions=tuple(args.extension or ()),
     )
     print(f"scaffolded {project}")
-    print(f"  language: {args.language}   backend: {args.backend}/{args.gpu}")
+    print(f"  language: {args.language}   backend: {args.backend}/{args.gpu}   agent: {args.agent}")
     print(f"\nnext:  kopt run {project} -n 20 --budget 20")
     return 0
 
@@ -55,6 +59,8 @@ def cmd_init_task(args) -> int:
         project=Path(args.project).resolve(),
         taskspec=Path(args.taskspec),
         force=args.force,
+        agent=args.agent,
+        extensions=tuple(args.extension or ()),
     )
     print(f"scaffolded task project {project}")
     print("  the target repo is isolated inside the project")
@@ -74,7 +80,7 @@ def _git_state(work: Path) -> tuple[str, str, str]:
 def _commit_generated_harness(cfg: TaskConfig) -> None:
     try:
         subprocess.run(
-            ["git", "add", "config.toml", ".omp", "harness"],
+            ["git", "add", "config.toml", "harness", *_agent_paths(cfg.root)],
             cwd=cfg.root, check=True, capture_output=True,
         )
         subprocess.run(
@@ -85,7 +91,7 @@ def _commit_generated_harness(cfg: TaskConfig) -> None:
         raise SystemExit(f"could not commit the generated harness: {exc}") from exc
 
 
-def _prepare_task(cfg: TaskConfig, args) -> float:
+def _prepare_task(cfg: TaskConfig, args, agent) -> float:
     """Use one isolated turn to generate the adapters kbench will orchestrate."""
     if taskmod.harness_is_prepared(cfg):
         taskmod.ensure_harness(cfg)
@@ -125,6 +131,9 @@ def _prepare_task(cfg: TaskConfig, args) -> float:
         model=args.model,
         thinking=args.thinking,
         fresh=True,
+        agent=agent.kind,
+        extensions=agent.extensions,
+        exclude_tools=agent.exclude_tools,
     )
     builder.run()
     check_untouched("harness builder")
@@ -161,7 +170,10 @@ def cmd_run(args) -> int:
         raise SystemExit(f"no config.toml in {project} — run `kopt init` first")
 
     cfg = bench_config.load(project)
-    setup_spent = _prepare_task(cfg, args) if isinstance(cfg, TaskConfig) else 0.0
+    agent = load_agent_config(project)
+    if args.agent:
+        agent = dataclasses.replace(agent, kind=args.agent)
+    setup_spent = _prepare_task(cfg, args, agent) if isinstance(cfg, TaskConfig) else 0.0
     remaining_budget = args.budget
     if remaining_budget is not None:
         remaining_budget = max(0.0, remaining_budget - setup_spent)
@@ -176,6 +188,9 @@ def cmd_run(args) -> int:
         model=args.model,
         thinking=args.thinking,
         fresh=args.fresh,
+        agent=agent.kind,
+        extensions=agent.extensions,
+        exclude_tools=agent.exclude_tools,
     )
     history = loop.run()
     done = sum(1 for i in history if i.experiment)
@@ -198,6 +213,20 @@ def cmd_watch(args) -> int:
     return 0
 
 
+def _agent_paths(project: Path) -> list[str]:
+    """Scaffolded agent-home paths that exist, whichever backend wrote them."""
+    return [p for p in (".omp", ".pi", "AGENTS.md") if (project / p).exists()]
+
+
+def _agent_args(parser) -> None:
+    parser.add_argument("--agent", default="omp", choices=BACKENDS,
+                        help="which coding agent runs the loop (default: omp)")
+    parser.add_argument(
+        "--extension", action="append", metavar="PATH",
+        help="pi only: extension to load, repeatable; the list is the complete set",
+    )
+
+
 def main() -> int:
     # Runs are long and usually backgrounded or piped, where Python block-buffers
     # stdout — the log stays empty for minutes and looks hung. Flush per line.
@@ -214,12 +243,14 @@ def main() -> int:
     i.add_argument("--backend", default="modal", choices=("local", "modal", "fal"))
     i.add_argument("--gpu", default="B200")
     i.add_argument("--force", action="store_true", help="overwrite a non-empty directory")
+    _agent_args(i)
     i.set_defaults(func=cmd_init)
 
     t = sub.add_parser("init-task", help="scaffold an isolated project from a task brief")
     t.add_argument("taskspec", help="path to the task brief TOML (becomes config.toml)")
     t.add_argument("project", nargs="?", help="directory to create (default: work/<task.name>)")
     t.add_argument("--force", action="store_true", help="overwrite a non-empty directory")
+    _agent_args(t)
     t.set_defaults(func=cmd_init_task)
 
     r = sub.add_parser("run", help="run the optimization loop")
@@ -228,18 +259,20 @@ def main() -> int:
     r.add_argument("--budget", type=float, help="stop once this much USD is spent")
     r.add_argument(
         "--max-time",
-        help="omp session lifetime, e.g. 20m; loop reconnects when it expires",
+        help="omp only: session lifetime, e.g. 20m; loop reconnects when it expires",
     )
     r.add_argument("--timeout", type=float, default=3600.0, help="seconds per iteration")
-    r.add_argument("--model", help="omp model (fuzzy: 'opus', 'claude-sonnet-4-5')")
+    r.add_argument("--model", help="model (fuzzy: 'opus', 'claude-sonnet-4-5')")
     r.add_argument(
         "--thinking",
         choices=("off", "minimal", "low", "medium", "high", "xhigh", "max"),
-        help="omp thinking level",
+        help="thinking level",
     )
     r.add_argument("--fresh", action="store_true",
-                   help="new omp session each iteration (default: persist one)")
+                   help="new agent session each iteration (default: persist one)")
     r.add_argument("--prompt", default=DEFAULT_PROMPT)
+    r.add_argument("--agent", choices=BACKENDS,
+                   help="override the project's [agent] kind for this run")
     r.set_defaults(func=cmd_run)
 
     w = sub.add_parser("watch", help="live web view of a run")
