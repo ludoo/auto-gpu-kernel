@@ -1,0 +1,65 @@
+# Decode-time bf16 GEMV on the DGX Spark (GB10, sm_121) — the first real sparkle target.
+#
+#   kopt init-task configs/bf16_gemv.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth \
+#       --extension ~/dev/kb-vault/code/pi-extensions/background-task
+#   kopt run work/bf16-gemv -n 8 --budget 20 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1, pytest), so the
+# kernel is developed on exactly the stack it will ship in.
+
+[task]
+name = "bf16-gemv"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `gemv(x, w)` in gemv.py faster on this GPU for the decode workload in bench.py:
+y = x @ W.T with x bf16 [M, K] for M in 1..4 and W bf16 [N, K] row-major, fp32
+accumulation, bf16 output, within the tolerances of test_gemv.py.
+
+Only gemv.py may change (you may add a helper module it imports). Do not call cuBLAS,
+torch.matmul/mm/linear, cutlass, or any prebuilt GEMM for the main path — the point is a
+kernel of your own (Triton is installed and works on this GPU) that streams a cold bf16
+weight matrix at close to DRAM bandwidth for these thin shapes. torch.compile is not
+allowed: the kernel will run inside CUDA graphs in production and must be a plain
+launch with no host-side work per call beyond computing the grid.
+
+The kernel must not autotune at runtime: any tile or block configuration must be chosen
+statically (per shape class is fine, by a rule on N, K and M read from the tensors),
+because production pins configurations and forbids runtime autotuning. Measure to
+choose the constants, then fix them in code.
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `pass_ms_mean` (lower is
+better), the mean over M=1 and M=4 of the summed cold-weight time for one full pass over
+the real shape mix in shapes.py. Quick mode may use `--quick` (M=4 only) but reports the
+same unit. Baseline is about 39.0 ms; the DRAM floor is about 30.4 ms (7.2 GB at the
+box's 237 GB/s). Every weight streams cold from DRAM by construction (distinct weights
+per call, an L2 scrub between rounds); do not defeat this.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. The tolerance is 1 bf16 ulp
+per element plus 1 ulp of the row's largest output, against an fp32 reference, on every
+shape in shapes.py at M=1..4, plus an accumulation test that a bf16 accumulator fails.
+"""
+hints = """
+Where the baseline loses: the big matrices (N*K >= 15M elements) already run at
+210-225 GB/s; the mid-sized ones (hc mixes [320,10240]/[10240,320], shared experts
+[640,2560]/[2560,640], gates [512,2560]) sit at 125-200 GB/s, and the tiny [48,2560]
+and [1,2560] projections are pure launch-latency floor. cuBLAS's pick for many of these
+is a 16x16-tile wmma kernel that cannot fill the chip on a cold weight. Think in terms
+of bytes in flight per SM: enough rows per block and enough blocks to cover the GPU,
+split-K when N is small and K is large, and vectorized 16-byte loads along K. Keep the
+fp32 partial sums in registers; if you split K across blocks, reduce the fp32 partials
+(an fp32 workspace or atomics), never bf16 partials.
+
+Check torch.cuda.get_device_properties() for SM count and L2 size before choosing
+constants. This is a unified-memory part: DRAM bandwidth is the ceiling for everything.
+"""
+
+[task.repo]
+path = "../examples/bf16-gemv"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read)"
