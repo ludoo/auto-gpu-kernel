@@ -1,0 +1,48 @@
+# PyTorch attention on a local NVIDIA GPU — the CUDA twin of mlx_attention.toml.
+#
+#   kopt init-task configs/torch_attention.toml --agent pi \
+#       --extension <anthropic-auth package dir> --extension <subagent extension dir>
+#   kopt run work/torch-attention -n 5 --model anthropic/claude-opus-5 --thinking low
+#
+# `path` is resolved relative to this file and snapshotted into the project as its own
+# git repo. `path_prepend` puts a venv with a CUDA torch, triton and pytest first on
+# PATH for everything kbench runs; edit it for your machine.
+
+[task]
+name = "torch-attention"
+workdir = "repo"
+path_prepend = "/home/ludo/.venvs/kopt-torch/bin"
+objective = """
+Make `attention()` in attention.py faster on the local NVIDIA GPU while keeping its
+signature, shapes, dtypes, and numerics within the tolerances of test_attention.py.
+
+Only attention.py may change. Do not call torch.nn.functional.scaled_dot_product_attention,
+flash-attn, xformers, or any other prebuilt attention op — the point is to build the fast
+path yourself (a Triton kernel with tiling and online softmax, avoiding materialized GQA
+repeats and masks, torch.compile, etc.). Triton is installed and works on this GPU.
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `geomean_median_ms`
+(lower is better). Quick mode may use `--quick` and fewer iterations but must report the
+same unit. Keep warmup so Triton compilation is excluded; timing is by CUDA events on
+the current stream, so GPU work is included and host overhead outside the call is not.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Full mode should also
+compare attention() against F.scaled_dot_product_attention on the exact bench.py
+workload shapes (float16 and float32), since the pytest shapes are small.
+"""
+hints = """
+The baseline materializes repeated K/V heads for GQA, the full [L, S] score matrix, and a
+boolean causal mask. Decode (L=1) is memory-bound on K/V reads; prefill is compute-bound.
+Check torch.cuda.get_device_capability() and torch.cuda.get_device_properties() for the
+chip: it may be an unusual compute capability, so verify what Triton features work
+before relying on them.
+"""
+
+[task.repo]
+path = "../examples/torch-attention"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GPU"
