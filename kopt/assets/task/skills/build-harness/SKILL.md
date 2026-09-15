@@ -49,6 +49,9 @@ Each script is killed after 30 minutes in quick mode and 60 minutes in full mode
 Anything the scripts write into the candidate checkout that git does not already ignore
 (build outputs, caches; bytecode is already disabled) is detected as a candidate change
 and fails the run — keep scratch under `--output`'s directory or a temp dir.
+The scripts themselves run under kbench's interpreter, which may not have the target's
+dependencies. Launch the target through `python` resolved from `PATH` (the brief's
+`path_prepend` puts the right environment first), never `sys.executable`.
 
 `quick` should be the cheapest reliable correctness gate. `full` should cover the
 behavior promised in the user's validation description. Write a JSON object to
