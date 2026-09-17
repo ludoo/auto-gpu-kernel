@@ -28,6 +28,9 @@ def stable_topk(logits, visible, k):
     among ties, -1 past the visible count; returned ascending per row."""
     cols = torch.arange(logits.shape[1], device=logits.device)[None, :]
     masked = logits.masked_fill(cols >= visible[:, None], float("-inf"))
+    if masked.shape[1] < k:
+        pad = masked.new_full((masked.shape[0], k - masked.shape[1]), float("-inf"))
+        masked = torch.cat([masked, pad], dim=1)
     idx = torch.sort(masked, dim=1, descending=True, stable=True).indices[:, :k].int()
     ranks = torch.arange(k, device=logits.device)[None, :]
     idx = torch.where(ranks < visible[:, None], idx, torch.full_like(idx, -1))
