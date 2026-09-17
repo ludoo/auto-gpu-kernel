@@ -1,0 +1,71 @@
+# The QSA indexer's masked top-k selection on the DGX Spark (GB10, sm_121) —
+# sparkle task next.40, kopt target 4.
+#
+#   kopt init-task configs/qsa_select.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth \
+#       --extension ~/dev/kb-vault/code/pi-extensions/background-task
+#   kopt run work/qsa-select -n 8 --budget 20 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1, pytest), so the
+# kernel is developed on exactly the stack it will ship in.
+
+[task]
+name = "qsa-select"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `masked_topk(logits, visible, out)` in qsa_select.py faster on this GPU: per row of
+a [4096, cols] fp32 score matrix, select the k=512 highest-scoring columns among the
+first `visible[row]` columns and write their indices as int32 into `out`, `-1` where a
+row has fewer than 512 visible columns.
+
+The selected SET is contractual and exact: descending score, and among tied scores the
+LOWEST column index wins. Most scores are exact zeros (relu output), so the rank-512
+boundary usually sits inside a tie — a kernel returning any other valid top-k set fails
+test_select.py. Output order within a row is free. Columns at or past a row's visible
+count are unwritten scratch (NaN in the tests) and must be excluded by the bound, never
+by comparing values.
+
+Only qsa_select.py may change (you may add a helper module it imports). No torch.topk /
+torch.sort on the full matrix for the main path — the point is a one-pass kernel of your
+own (Triton is installed and works on this GPU) that reads each row once. torch.compile
+is not allowed: production replays this under CUDA graphs, so the call must be a plain
+launch with no host-side work per call beyond computing the grid from tensor shapes, no
+runtime autotuning (choose block constants statically by a rule on cols; measure to
+choose them, then fix them in code), and no allocations that vary call to call
+(a fixed-size workspace allocated per call shape is fine).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `select_ms_mean` (lower is
+better), the mean over the 66k-context (cols=16512) and 180k-context (cols=45056) widths
+of the median per-call milliseconds at T=4096 rows. Quick mode may use `--quick`
+(66k only), same unit. Baseline is ~13 ms at 66k; one read of the matrix at the box's
+~237 GB/s is ~1.1 ms (66k) and ~3.1 ms (180k) — the floor for a one-pass kernel.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Validation is EXACT set
+equality against a stable-sort reference — the tie rule, the visible bound with NaN
+scratch, determinism over 8 calls, and CUDA-graph capture/replay. There is no numeric
+tolerance and none may be introduced.
+"""
+hints = """
+A per-row top-k with k=512 and rows up to 45056 columns: think one program (or a small
+fixed number) per row, streaming the visible prefix in tiles with 16-byte vectorized
+loads, keeping a running candidate set in registers or shared memory. A two-level
+approach also works if it stays one read of the matrix: a per-tile reduction pass that
+emits per-tile candidates plus a small second pass over candidates only (the second
+pass's input is k * num_tiles elements, not the matrix). Exact tie handling is the crux:
+prefer comparing (score, -index) pairs, or pack score and inverted index into one
+sortable 64-bit key (fp32 scores are non-negative here except the -inf/NaN scratch you
+must not read; zero is common and tied). visible[row] is monotonically non-decreasing
+down the rows of a chunk. Rows are independent — there is no cross-row reduction.
+torch.cuda.get_device_properties() for SM count and shared-memory size before choosing
+constants. Unified-memory part: DRAM bandwidth (~237 GB/s) is the ceiling.
+"""
+
+[task.repo]
+path = "../examples/qsa-select"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read)"
