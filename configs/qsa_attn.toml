@@ -3,8 +3,9 @@
 # at decode and verify without changing a byte of its output.
 #
 #   kopt init-task configs/qsa_attn.toml --agent pi \
-#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth \
-#       --extension ~/dev/kb-vault/code/pi-extensions/background-task
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   (auth only: with a background-task extension loaded the agent ends its turn with
+#   the bench in flight, and kopt reads three such turns as a stall — 2026-09-24)
 #   kopt run work/qsa-attn -n 10 --budget 40 --model anthropic/claude-opus-5 --thinking medium
 #
 # `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1, pytest),
