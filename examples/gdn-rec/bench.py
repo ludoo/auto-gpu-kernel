@@ -35,7 +35,7 @@ from data import make_inputs
 from gdn_rec import gdn_recurrence
 from shapes import SHAPES
 
-# The shipped kernel on this box, seed 0, medians of three bench runs (2026-09-25).
+# The shipped kernel on this box, seed 0, medians of three bench runs (2026-09-24).
 BASELINE_US = {"t1": 20.6, "t5": 97.1, "chunk": 4536.0, "pinchunk": 7108.0}
 
 
