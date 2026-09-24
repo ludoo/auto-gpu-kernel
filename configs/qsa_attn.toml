@@ -1,0 +1,113 @@
+# The QSA sparse attention kernel on the DGX Spark (GB10, sm_121) — sparkle
+# task next.75, kopt target 6: the served (M-pinned) configuration made fast
+# at decode and verify without changing a byte of its output.
+#
+#   kopt init-task configs/qsa_attn.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth \
+#       --extension ~/dev/kb-vault/code/pi-extensions/background-task
+#   kopt run work/qsa-attn -n 10 --budget 40 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1, pytest),
+# so the kernel is developed on exactly the stack it ships in.
+
+[task]
+name = "qsa-attn"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `qsa_attention(q, k_cache, v_cache, packed, block_table, token_to_req, out)` in
+qsa_attn.py faster on this GPU at all three served row counts — M=1, M=5 and M=8192 —
+while producing output BITWISE identical to reference.py's `reference_attention` on every
+input. Sparse paged grouped-query attention: per query row and KV head, attend the 12
+query heads of the group over 2051 selected tokens (65 tiles of 32, gathered from a
+131k-token paged bf16 cache through a block table), online softmax in fp32, bf16 out.
+
+The bytes are the contract and they are the reference kernel's exact arithmetic: a
+per-tile online softmax whose accumulator is threaded through the tensor-core mma's C
+operand in tile order (tile 0 first, 65 tiles), scores from `tl.dot(query, keys)` scaled
+by log2(e)/16 after the dot, exp2 against the running max, one warp per program,
+BLOCK_N 32, BLOCK_M 16, HEAD_DIM 256. The serving engine pins every phase (decode,
+verify, prefill) to this one configuration so that a token's attention does not depend
+on which phase computed it; your kernel replaces it in every phase, so it must reproduce
+those bytes at every M. Any change that alters the mma chain, the tile order, the
+reduction layout or the rounding sequence of a single output element fails
+test_attn.py — which compares 150M+ output elements against the reference, because on
+this box a wrong kernel (the same source at 4 warps) differs in only ~1 element per
+250,000 and passes M=1 and M=5 by luck.
+
+Only qsa_attn.py may change (you may add helper modules it imports). reference.py,
+data.py, shapes.py, test_attn.py and bench.py are read-only. No torch attention /
+matmul / softmax on the main path and no torch.compile: the engine replays this call
+under CUDA graphs at decode and verify, so the call is a plain launch (or a fixed short
+sequence of launches) with no host sync, no data-dependent host work, and no runtime
+autotuning — constants are chosen statically (by a rule on the row count if you like),
+measured, then fixed in code. Per-call workspace allocations through torch are fine;
+shape-keyed caches are not (the engine's prefill row count varies chunk to chunk).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `attn_score` (lower is
+better): the geometric mean over the three shapes of (median per-call µs / the shipped
+kernel's µs on this box). 1.0 is the baseline; the three shapes weigh equally, so a
+candidate that speeds decode up and slows the chunk down does not win. Quick mode
+(`--quick`) times M=1 and M=5 only, same unit. Baseline: M=1 106.9 µs, M=5 129.3 µs,
+chunk 78.0 ms (M=5 wanders 130–137 µs run to run; use A/B for small deltas). Floors from the same kernel's split-k rows (which do not reproduce the
+bytes): M=1 29.9 µs, M=5 41.2 µs. The chunk on a contiguous selection runs 28.4 ms —
+that is the arithmetic's cost at prefill; the other 50 ms is the random gather.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Validation is BITWISE
+equality of the bf16 output against the reference kernel at M=1, 5 and 8192 (three seeds
+at 8192), with short rows (count below the budget, -1 past it, a zero-count row) and
+with four requests through the block table; determinism over 8 calls; CUDA-graph
+capture and replay with inputs swapped between replays. There is no tolerance and none
+may be introduced. Do not edit the tests; a candidate that needs them changed is wrong.
+"""
+hints = """
+What has been measured on this box (all bitwise-checked against the reference):
+
+- At M=1 the gather latency is NOT the cost. The reference on a contiguous selection
+  with an identity page table (every tile's lines sequential, L2-warm) runs 105.7 µs
+  against 106.9 random. The cost is the one-warp serial chain: 65 tiles x ~1.6 µs, and a
+  tile is ~1.4 µs of load issue on one warp (num_stages=1 runs 200 µs) overlapped with
+  ~1.5 µs of one-warp compute — two 16x32x256 bf16 dots (~0.8 µs of tensor-pipe
+  throughput on a single SM sub-partition), a 16x32 exp2, two row reductions, and the
+  layout conversion of the transposed K tile. num_stages=3 gives 96.6 µs (equal bytes);
+  4 stages exceed shared memory (32 KB of K+V per stage). Resolving the page-table
+  indirection in a prologue kernel changes nothing (115 µs). The grid at M=1 is 2
+  programs on a 48-SM part: parallelism with identical per-element arithmetic is the
+  question, e.g. can the 256 output dims of the P·V dot be split across programs or
+  warps while every element's mma chain stays identical, with the (redundant) score dot,
+  max and normalizer recomputed per program? Check the bytes at 8192 rows before
+  believing any layout change — the reference at 4 warps is bitwise equal at M=1 and
+  M=5 and wrong at 8192.
+
+- Split-k partials merged afterwards can NOT reproduce the bytes: the mma's accumulate
+  is not an IEEE fp32 add. Measured: dot(P, V, acc=C) != dot(P, V) + C in every trial,
+  ~50% of elements, relative differences to 8e-5 (and at large |C| the fused path is
+  the less accurate one). The zero-start dot(P, V, acc=0) == dot(P, V) is exact. So
+  each output element's accumulator must pass through the same sequence of mma C
+  operands, tile 0 to 64, with the same alpha rescaling in between.
+
+- At the chunk (8192 rows, 16384 programs) the random gather is the cost: 78 ms random
+  vs 28 ms contiguous. With num_stages=2 the reference needs ~64 KB of shared memory
+  per program, so only one program (one warp) is resident per SM at prefill; stages 3
+  makes it 107 ms, stages 1 does not help (79 ms). Occupancy and the load pattern of the
+  paged gather (each selected token is one 512 B K row and one 512 B V row; a 16-token
+  page is 8 KB contiguous per KV head) are the levers there; the arithmetic is not.
+
+- The M=5 verify pass is the served step's row (12 layers x 129 µs a step); M=1 is the
+  draft-off step; the chunk is TTFT. All three count.
+
+- Do not touch: the score scaling (scores *= log2e/16 after the dot, not on q), the
+  -1e20 masking, exp2, the normalizer's `n*alpha + sum(p)` form, the final divide and
+  the `has_values` guard, the trailing count column's role as the tile-loop bound. Those
+  are the bytes. torch.cuda.get_device_properties() for SM count and shared memory
+  before choosing constants. Unified-memory part: ~237 GB/s DRAM, 48 SMs, sm_121.
+"""
+
+[task.repo]
+path = "../examples/qsa-attn"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs)"
