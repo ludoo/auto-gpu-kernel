@@ -1,0 +1,139 @@
+# The GDN recurrence kernel on the DGX Spark (GB10, sm_121) — sparkle task D.4,
+# kopt target 7: the one kernel that serves every phase made faster without
+# changing a byte of any output.
+#
+#   kopt init-task configs/gdn_rec.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/gdn-rec -n 8 --budget 40 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, nvcc via torch's
+# load_inline), so the kernel is developed on exactly the stack it ships in.
+
+[task]
+name = "gdn-rec"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `gdn_recurrence(q, k, v, g, beta, h0, *, states=False, pin_at=None, out=None)` in
+gdn_rec.py faster on this GPU at the four served launches — T=1; T=5 with per-row states;
+T=8192; T=8192 with pin_at=4096 — while producing outputs BITWISE identical to
+reference.py's on every input: `o` (bf16 [rows, HV, V]), `ht` (fp32 [n, HV, V, K], the
+state after each entry's last row), `states` (fp32 [rows, HV, V, K], the state after every
+row, when asked), `pin` (fp32 [HV, V, K], the state after row pin_at-1, when asked). The
+gated-delta-net recurrence: H=16 QK heads, HV=48 V heads, K=V=128, a 3 MiB fp32 state per
+call, one sequential recurrence per (V head, V row) over the T rows of each of n entries.
+
+The bytes are the contract and they are the reference kernel's exact arithmetic, per row
+per step, per state element h[v][k] (fp32 throughout, `expf`, `fmaf`):
+  1. h *= e where e = expf(g)                                (once per row per V head)
+  2. dot = sum_k h[k] * kk[k]  — as: each lane holds a contiguous quarter of K (32
+     values, KSPLIT=4) and accumulates them into FOUR interleaved fp32 accumulators
+     a[j % 4] by fmaf in ascending k; then (a0 + a1) + (a2 + a3); then across the four
+     lanes of a row: dot += shfl_xor(dot, 8); dot += shfl_xor(dot, 16) — that pairing,
+     quarters {0,1} and {2,3} first, then the two halves.
+  3. u = (v - dot) * beta                                     (v bf16 -> fp32)
+  4. h[k] = fmaf(u, kk[k], h[k])
+  5. o = sum_k h[k] * q[k] — the same four-accumulator chain and the same shuffle tree
+     as step 2, on the UPDATED h; stored as bf16 by __float2bfloat16 (round to nearest).
+Any change to that sequence — a different number of accumulators, a different
+lane/quarter pairing in the shuffle tree, a fused multiply where the reference has a
+separate one, a different exp — changes bytes and fails test_rec.py, which compares
+`o`, `ht`, `states` and `pin` at 8192 rows over three seeds, at T=1..8 x n=1..4, and on
+the served model's captured inputs. Every output tensor is checked, not just `o`:
+`states` and `pin` are the verify pass's and the residency pin's inputs downstream.
+
+What is free: everything around that arithmetic. The launch geometry (blocks, warps
+per block, which warp owns which rows), what is staged where and how (the cp.async
+ring, its depth, shared-memory layout), how the state is loaded from and stored to
+global memory (direct or through a staging tile, coalescing, vector width, the ordering
+of the per-row state writes against the next row's compute), the register budget, the
+number of kernel instantiations and the rule that picks one — as long as the rule reads
+only shapes and flags, never data. Rows are independent across (V head, V row) and
+across entries; a row's arithmetic is a serial chain over its T steps.
+
+Only gdn_rec.py may change (you may add helper modules it imports). reference.py,
+data.py, shapes.py, test_rec.py and bench.py are read-only. No torch compute on the
+main path and no torch.compile: the engine replays T=1 and T=5 under CUDA graphs, so
+the call is a plain launch (or a fixed short sequence of launches) with no host sync and
+no data-dependent host work. Per-call allocations through torch are fine (the reference
+allocates its outputs per call); a shape-keyed cache is not (the chunk's T varies chunk
+to chunk). The compiled extension name in gdn_rec.py (`_NAME`) must stay distinct from
+the reference's; bump it when you change the CUDA source if the build cache misbehaves.
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `rec_score` (lower is
+better): the geometric mean over the four shapes of (median per-call µs / the shipped
+kernel's µs on this box). 1.0 is the baseline; the four shapes weigh equally, so a
+candidate that speeds the verify pass up and slows the chunk down does not win. Quick
+mode (`--quick`) times t1 and t5 only, same unit. Baseline: t1 20.6 µs, t5 97.1 µs,
+chunk 4536 µs, pinchunk 7108 µs (pinchunk wanders ~2% run to run, the chunk ~0.3%; use
+A/B for small deltas). Floors, measured on this box: writing 15 MiB with `fill_` takes
+71.9 µs and the t5 launch's five state writes cost 75.8 µs over the no-states launch's
+23.1 — those bytes are at the DRAM write floor, only overlap can hide them. A 3 MiB
+copy runs at L2 speed (6.3 µs; the 3 MiB state fits L2, 15 MiB does not). The chunk runs
+0.56 µs per row-step on the serial chain against an FMA-pipe floor of ~0.25. The pinned
+chunk at a grid that fits one wave (HV=42, 336 warps) runs 5.05 ms against 4.76 plain.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Validation is BITWISE
+equality of `o`, `ht`, `states` and `pin` against the reference kernel at the four served
+launches (three seeds at 8192 rows), over T=1..8 x n=1..4 with and without per-row
+states, at pins at several positions, on the served model's captured kernel inputs, T
+rows in one launch against T single-row launches, determinism over 8 calls, and
+CUDA-graph capture and replay with inputs swapped between replays. There is no tolerance
+and none may be introduced. Do not edit the tests; a candidate that needs them changed
+is wrong.
+"""
+hints = """
+What has been measured on this box (sparkle D.2, next.74 and this session's probes):
+
+- The kernel has two instantiations on a WRITES template bool. The plain one (t1, chunk:
+  124 registers, 3.6 KB static shared for the 3-deep cp.async ring) reads the state at
+  the start and writes it at the end straight from the register layout — a lane's slice
+  is a quarter row (128 B at 512 B stride), so those two 3 MiB passes run at half sector
+  efficiency; t1 is 20.6 µs for 6 MiB of state traffic and D.2 measured 11.3 µs when the
+  same load/store went through a coalescing staging tile. The WRITES one (t5, pinchunk)
+  carries that 8 KB warp-private staging tile (16 rows x (128+4) floats) so the per-row
+  state writes go out as 512 B rows: 184 registers, 12 KB static shared. The tile's
+  presence alone cost 45 registers in the hot loop and +31% on the chunk, which is why
+  the plain instantiation does not carry it. Neither instantiation spills.
+
+- The WRITES instantiation runs in TWO WAVES. ncu: 12.05 KB static shared + 1 KB driver
+  shared per block against 102.4 KB per SM caps it at 7 blocks per SM (registers cap it
+  at 8); the grid is 8 x HV=48 = 384 one-warp blocks = 8 per SM; so 336 run in a first
+  wave and 48 in a second. At the pinned chunk that tail runs the whole 8192-step loop
+  alone after the others finish: 7108 µs against 4536 plain, and 5.05 ms at a grid that
+  fits one wave (HV=42). At t5 the tail is ~10 of the 97 µs (76.6 µs at HV=42, which is
+  245 GB/s over its 13.1 MiB of writes — the write floor). So: pinchunk is mostly the
+  tail wave; t5 is mostly bytes at the floor with the tail on top; t1 is the half-sector
+  state read and write; the chunk is the serial chain's latency.
+
+- The chunk: 384 warps on 48 SMs, one warp per block, 8 per SM, a serial chain of 8192
+  steps per warp. next.74 measured the template constants and they are pinned by the
+  bytes anyway: KSPLIT=4 sets the shuffle tree; two rows per lane (RPL=2) because the
+  LSU charges nominal bytes per LDS.128 whether broadcast or not and one row per lane
+  puts that above the FMA floor; ring depth 3 because 2 exposes L2 latency and 8
+  overflows shared memory at 16 warps per SM. Untried there: the 8 warps of one V head
+  each stage the SAME k and q rows (1 KB per step) through their own ring — 8x
+  redundant L2 traffic, ~1 GB per layer per chunk; whether sharing that staging across
+  warps of a block (with the barrier it needs) beats the private ring is an open
+  question, as is anything that shortens the per-step dependent chain between the
+  cp.async wait and the last shuffle.
+
+- Do not touch: the four-accumulator interleave, the (a0+a1)+(a2+a3) finish, the
+  shfl_xor 8-then-16 tree with KSPLIT=4 quarters, expf, the bf16 conversion of v and o,
+  the order h*=e -> dot -> u -> h+=u*k -> o. Those are the bytes. The state layout in
+  memory ([HV, V, K] fp32, row-major) is the contract's; the register layout is not.
+  torch.cuda.get_device_properties() for SM count and shared memory before choosing
+  constants. Unified-memory part: ~237 GB/s DRAM (219 write with fill_), 48 SMs,
+  102.4 KB shared per SM, sm_121. The kernel is built with torch's load_inline
+  (nvcc -O3); ptxas register and spill counts come from `-Xptxas -v` in
+  extra_cuda_cflags, and `ncu` is on the path.
+"""
+
+[task.repo]
+path = "../examples/gdn-rec"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs)"
