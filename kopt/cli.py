@@ -91,6 +91,36 @@ def _commit_generated_harness(cfg: TaskConfig) -> None:
         raise SystemExit(f"could not commit the generated harness: {exc}") from exc
 
 
+def _gpu_compute_pids() -> list[str]:
+    """PIDs with a CUDA context, per nvidia-smi; empty when unknown."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _wait_for_idle_gpu(limit_s: float = 900.0) -> None:
+    """The builder turn may end with a benchmark of its own still running;
+    a pristine baseline measured on top of it is wrong for the whole run."""
+    import time
+
+    deadline = time.monotonic() + limit_s
+    pids = _gpu_compute_pids()
+    if not pids:
+        return
+    print(f"\nGPU busy (compute pids {', '.join(pids)}); waiting before the pristine runs.")
+    while pids and time.monotonic() < deadline:
+        time.sleep(5)
+        pids = _gpu_compute_pids()
+    if pids:
+        raise SystemExit(f"GPU still busy after {limit_s:.0f}s (pids {', '.join(pids)}); "
+                         "refusing to measure pristine baselines on a shared device")
+
+
 def _prepare_task(cfg: TaskConfig, args, agent) -> float:
     """Use one isolated turn to generate the adapters kbench will orchestrate."""
     if taskmod.harness_is_prepared(cfg):
@@ -140,6 +170,7 @@ def _prepare_task(cfg: TaskConfig, args, agent) -> float:
 
     taskmod.ensure_harness(cfg)
     generated_rev = taskmod.harness_rev(cfg)
+    _wait_for_idle_gpu()
     print("\nRunning pristine quick and full baselines through kbench.")
     adapter = adapters.get(cfg)
     baselines = []

@@ -106,4 +106,7 @@ Do not create `harness/prepared.json`; kopt writes it after both pristine runs p
 
 Run both scripts directly for quick mode, and full mode when practical. Inspect their
 JSON and clean exploratory outputs. Confirm the target HEAD and status are unchanged.
-Return a short summary; kopt will then run both modes through kbench.
+Run every check in the foreground and let it finish: kopt starts the pristine
+baselines the moment this turn ends, and a benchmark of yours still running then
+contends for the GPU and corrupts the baseline every later experiment is judged
+against. Return a short summary; kopt will then run both modes through kbench.
