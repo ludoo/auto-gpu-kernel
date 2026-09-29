@@ -1,0 +1,110 @@
+# The M-invariant linear's thin tile on the DGX Spark (GB10, sm_121) — sparkle
+# task next.89, kopt target 8: the decode-time launch of a kernel whose bytes are
+# fixed, made to stream its weight at the DRAM rate.
+#
+#   kopt init-task configs/mconst_thin.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/mconst-thin -n 8 --budget 40 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13, triton 3.7.1), the stack the
+# kernel ships in.
+
+[task]
+name = "mconst-thin"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `linear(x, w, *, tile='thin')` in mconst_thin.py faster on this GPU at the served
+decode launch — x bf16 [M, 10240] with M=1 and M=5, w bf16 [336, 10240], y bf16 [M, 336],
+96 back-to-back calls over 96 DISTINCT weights per step, so every call streams its 6.9 MB
+weight from DRAM — while producing output BITWISE identical to reference.py's on every
+shape, every M and both tile names.
+
+The bytes are the contract and they are the reference's reduction: for each output
+element, one fp32 accumulator, `tl.dot` over the K dimension in 64-wide chunks in
+ascending order (`acc = tl.dot(x_chunk, w_chunk.T, acc)` for k0 = 0, 64, 128, ...,
+K-64), then one rounding to bf16. Any change to that — a different chunk width for the
+dot, a different order, split-K with a merge, a second accumulator, a non-MMA path
+(fma loops, `tl.sum` of products), a different rounding — changes bytes and fails
+test_thin.py. The tile (BM, BN, num_warps, num_stages) does NOT enter the bytes: every
+one of 81 variants swept was byte-equal, which is why it is free to choose.
+
+What is free: everything around that chain. How much of w and x is loaded per stage and
+how far ahead (a stage can load a 256-wide K slab and feed it to four dots in order —
+same bytes), the load shape and vector width, the number of programs and what each
+covers (a program could own fewer than 16 columns and mask, or two column tiles
+interleaved, as long as each element's chain is the reference's), the pipelining depth,
+the accumulator layout, cache hints (`eviction_policy`), a second kernel for M=1 with
+its own launch shape if that helps, and the static rule that picks a configuration from
+(N, K, M) — a rule that reads shapes only, never data. M is a runtime int and must stay
+`do_not_specialize`-d or equivalent: the served graph captures the M=1 and M=5 launches
+and replays them, so the call is a plain launch (or a fixed short sequence) with no host
+sync and no data-dependent host work; per-call output allocation through torch is fine.
+The `wide` tile's behaviour must survive (the tests run it up to M=8192 on both shapes)
+but its speed is not measured and not a goal.
+
+Only mconst_thin.py may change (you may add helper modules it imports). reference.py,
+shapes.py, test_thin.py and bench.py are read-only. No cuBLAS / torch.matmul on the
+main path; no torch.compile; no runtime autotuning (a static configuration per shape
+class chosen once, in code).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `thin_score` (lower is
+better): the geometric mean over M=1 and M=5 of the median per-call µs of a cold 96-call
+chain over 96 distinct weights, each divided by the shipped kernel's µs on this box.
+1.0 is the baseline. Quick mode (`--quick`) runs fewer rounds, same unit. Baseline:
+47.4 µs at M=1 and 47.4 at M=5 (145 GB/s), run-to-run spread ~0.5%; use A/B for small
+deltas. Reference points on the same cold chain: cuBLAS 37.1 (M=1) / 36.2 (M=5),
+~190 GB/s; the weight's 6.88 MB at the 237 GB/s DRAM read rate is 29.0 µs, the floor.
+Timing one weight in a loop measures L2, not this: the same call reads 18.6 µs hot.
+"""
+validate = """
+Run `python -m "pytest
+
+🔮 View transcript: https://agentlogs.home.qix.it/s/w8r5dyxq7uhm069ank2bmt71" -q` in the repo; every test must pass. Validation is BITWISE
+equality of the output against the reference kernel on both served shapes ([336, 10240]
+and [12800, 2560]) at M = 1..8, 16, 63, 4096 and 8192, under both tile names; a row's
+bytes at M=1 and M=5 equal to the same rows of an M=8 call; determinism over 8 calls;
+and CUDA-graph capture and replay with inputs swapped between replays. There is no
+tolerance and none may be introduced. Do not edit the tests; a candidate that needs
+them changed is wrong.
+"""
+hints = """
+What is known on this box (sparkle D.3 and this session's probes):
+
+- The shape is purely bandwidth-bound: 6.88 MB of weight, 20 KB of x at M=1, 160 dots of
+  [16 x 64] x [64 x 16] per program. At BN=16 the grid is 21 programs on 48 SMs, each
+  walking 160 K-chunks with 4 stages of (16 x 64 x + 16 x 64 w) bf16 = 4 KB per stage in
+  flight; roughly 340 KB outstanding across the grid. Covering ~1 µs of DRAM latency at
+  237 GB/s wants on the order of 240 KB in flight PER MICROSECOND of chain time; the
+  chain runs ~47 µs, so the pipe is mostly empty. cuBLAS's gemv-class kernel reaches
+  190 GB/s on the same cold chain; the floor is 237.
+
+- The D.3 sweep over BM in {16,32,64} x BN in {16,32,64} x warps {1,2,4} x stages
+  {2,3,4} found every variant byte-equal and BM16 BN16 w4 s4 the fastest — HOT. Nobody
+  has measured the variants cold; a wider BN cuts programs (BN=64 → 6 programs), a
+  narrower per-program slice with more stages or a wider K slab per stage keeps more
+  bytes moving. Measure cold, always: bench.py rotates 128 weights.
+
+- The x operand is tiny and shared by every program; it is L2-resident after the first
+  program touches it. The weight is read exactly once per call and never again in the
+  step: `eviction_policy='evict_first'` on w is the natural hint, and target 1's runs
+  measured it worth ~1% on a similar GEMV.
+
+- tl.dot's minimum operand is 16 x 16, so BM=16 pads M=1 to 16 rows of x (masked to
+  zero): 15/16 of the MMA work is on zeros and does not matter — the MMA pipe is
+  nowhere near the bottleneck. Do not replace the dot with FMA arithmetic to avoid the
+  padding; that changes bytes.
+
+- Unified-memory part: ~237 GB/s DRAM read, 48 SMs, sm_121, triton 3.7.1 on torch 2.13.
+  `torch.cuda.get_device_properties()` for the SM count. Byte-equality is cheap to
+  check: `torch.equal(candidate, reference.linear(...))` on the same tensors; run it on
+  every configuration you time, in the foreground, before any bench number is logged.
+"""
+
+[task.repo]
+path = "../examples/mconst-thin"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs)"
