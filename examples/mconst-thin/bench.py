@@ -25,7 +25,7 @@ from shapes import SERVED_M, SHAPES
 
 N, K, CALLS = SHAPES['down_inject']
 ROT = 128
-# The shipped thin tile on this box, median of three runs (2026-09-30, three bench runs 47.3-47.6).
+# The shipped thin tile on this box, median of three runs (2026-09-29, three bench runs 47.3-47.6).
 BASELINE_US = {1: 47.4, 5: 47.4}
 # cuBLAS on the same cold chain, for reference only: 37.1 (M=1), 36.2 (M=5).
 FLOOR_US = N * K * 2 / 237e3  # the weight's bytes at the DRAM read rate
