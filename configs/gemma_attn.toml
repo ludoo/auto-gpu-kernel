@@ -1,0 +1,135 @@
+# Gemma 4 12B's paged attention on the DGX Spark (GB10, sm_121) — sparkle
+# task next.120, kopt target 9: one kernel for both attention kinds whose
+# output bytes are a function of the row alone, at FlashInfer's price.
+#
+#   kopt init-task configs/gemma_attn.toml --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/gemma-attn -n 12 --budget 60 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1,
+# flashinfer, pytest), so the kernel is developed on the stack it ships in.
+
+[task]
+name = "gemma-attn"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `gemma_attention(q, pages, qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+pos_base, window_left, out)` in gemma_attn.py fast on this GPU — at par with
+FlashInfer's paged prefill kernel (bench.py's BASELINE_US) at every cell: decode (1
+row), verify (4 rows) and the 4096-row prefill chunk, on both of gemma's geometries
+(shapes.py: sliding 16q/8kv head_dim 256 under a 1024-key window over a gathered page
+ring; global 16q/1kv head_dim 512 over the whole sequence, kv 4k/32k/128k) — while
+holding the contract test_attn.py states:
+
+1. INVARIANCE, BITWISE. A row's output bytes are a function of the row alone (its
+   query, the keys it may attend, its position, the window) — never of how many rows
+   were in the call, where the call started, which tile the row rode in, how many keys
+   sat past it, or which other sequences shared the launch. The tests compute every
+   row of a 1600-position sequence whole, chunked at five splits, one row at a time,
+   four at a time, 1/2/3 at a time, and two sequences per launch, and require equal
+   bytes; plus long-context tails at 32k and 128k. No tolerance exists or may be added.
+2. CORRECTNESS, within bf16 rounding of an fp32 reference: on every arm the rel-L2
+   distance from reference.py's fp32 attention is at most twice the wheel's own.
+
+The starting kernel holds the contract by construction and is slow: one program per
+(row, kv head), the row's group heads as the mma's M, key leaves of 32 on a grid
+anchored at absolute position 0, the fp32 online softmax folded in registers in leaf
+order, no kv split — decode on the global kind walks 128k keys in one program. The
+contract is the only thing it has; everything else is yours.
+
+Only gemma_attn.py may change (you may add helper modules it imports). shapes.py,
+data.py, reference.py, test_attn.py and bench.py are read-only. No torch attention /
+matmul / softmax on the main path and no torch.compile. The engine replays this call
+under CUDA graphs at decode and verify: a plain launch (or a fixed short sequence of
+launches) with no host sync, no data-dependent host work (the metadata is read on
+device — `qo_indptr` and friends are device int32 tensors rewritten between replays;
+only shapes and `window_left` are static), no runtime autotuning — constants chosen
+statically (a rule on the row count is fine), measured, then fixed. Per-call workspace
+allocations through torch are fine; shape-keyed caches are not (the prefill row count
+varies chunk to chunk).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `attn_score` (lower is
+better): the geometric mean over 12 cells of (median per-call µs / FlashInfer's µs on
+this box). 1.0 is par with the wheel; every cell weighs equally, so winning decode and
+losing the chunk does not win. Cells: sliding decode/verify/chunk at kv 32k (its bytes
+are context-independent: ≤1040 keys at decode, 5120 at the chunk); global
+decode/verify/chunk at kv 4k, 32k and 128k. Quick mode (`--quick`) runs the decode and
+verify cells only. Each cell rotates its inputs over sets exceeding 4x L2, so the
+figure is cold. The wheel's figures (µs): sliding decode 47 / verify 48 / chunk 1117;
+global decode 50 / 304 / 1138, verify 74 / 591 / 2246, chunk 7842 / 121891 / 516091 at
+4k / 32k / 128k. The naive starting kernel scores 4.52: sliding 1.85 / 1.84 / 16.8x,
+global decode 9.7-13.1x, verify 6.3-6.6x, chunk 1.42-1.45x.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass (36 tests, ~10 s on the
+starting kernel). Invariance is BITWISE on every arm; correctness is within twice the
+wheel's rel-L2 from fp32; determinism over 8 calls; CUDA-graph capture and replay at
+rows 1 and 4 with the metadata rewritten between replays; no torch attention op on the
+path. Do not edit the tests; a candidate that needs them changed is wrong.
+"""
+hints = """
+What has been measured on this box, and what the invariant forbids:
+
+- The wheel's prices and where they sit. Global decode at 128k: 1138 µs for 256 MiB of
+  K/V = 236 GB/s, the DRAM ceiling (the practical read rate is ~237-250 GB/s). Global
+  VERIFY (4 rows) at 128k: 2246 µs — the same bytes at half the rate; the wheel's
+  CTA_TILE_Q-32 class is 2x off its own decode floor, so par on verify is not the
+  ceiling. The global CHUNK: 518 ms per layer at 128k, 7.9 ms at 4k — about 35 TFLOPS
+  against a measured 126 TFLOPS dense bf16 peak on this part (the head_dim-512 template
+  is the slow one); the sliding chunk runs ~61 TFLOPS. Sliding decode: 42 µs for
+  8.1 MiB (200 GB/s). So decode is at the ceiling and verify and the global chunk are
+  not: par at decode is a bandwidth problem, par at the chunk a tensor-pipe one.
+
+- Why the wheel fails the contract (sparkle's census, read from its source and confirmed
+  on the box): its kv-tile grid is anchored at each q tile's window start, so a chunk
+  start off the 32-row grid moves every row whose anchor passes 0; its CTA_TILE_Q moves
+  with the row count (16 at 1-2 rows, 32 above on the global kind; 16 at ≤8 rows, 64
+  above on the sliding) and with it the warp layout and kv split; and ~1% of rows move
+  with the q tile they ride in even on an absolute grid, mechanism not read. Each is a
+  thing the invariant forbids, not a mechanism to copy. A FULLY MASKED LEAF MUST BE AN
+  EXACT NO-OP and a row's leaf set must not depend on its tile: check it the way the
+  tests do — the same rows at offsets 0, 700, 1025 against the whole — before believing
+  any tiling; a wrong kernel shows in a handful of rows.
+
+- The arithmetic that is exact by construction (sparkle next.75's probes, on this part):
+  (1) `dot(P, V, acc=C) != dot(P, V) + C` — the mma's accumulate is not an IEEE fp32
+  add, in ~50% of elements, so a fold threaded through the mma's C operand at one end
+  cannot be reproduced by merging partials at the other; (2) the zero-start
+  `dot(P, V, acc=0) == dot(P, V)` is exact; (3) a max is exactly associative, a sum is
+  not; (4) rows of a tile do not interact in the mma, so a single row may ride a padded
+  tile without a class of its own — provided the fold is the same. So the design
+  question to answer first: what fold is the SAME arithmetic whether it runs in
+  registers over a row tile at the chunk and across programs at decode? A fixed leaf
+  grid in absolute position space with the same fold order at both ends is one shape;
+  two passes (an exact max, then a fixed-tree sum) is another; recomputing the scores
+  per program and splitting only V's output columns is a third. Measure, do not assume.
+  Decode on the global kind at 128k is 4096 leaves of 32: a single program cannot reach
+  the ceiling, and whatever parallelism you add must fold to the chunk's bytes.
+
+- The sliding kind's key index space is the GATHER, not the sequence: `kv_indices`
+  starts at a page boundary at or before the window start and the absolute position of
+  gather key `j` is `pos_base + j` (shapes.py). An absolute grid lives in position
+  space; a grid of 16-key leaves is a page and needs no offset, a wider one needs
+  `pos_base`. The sliding gather holds ≤ 5120 keys at the chunk whatever the context.
+
+- The part: 48 SMs, sm_121, 24 MiB L2, ~237-250 GB/s practical read, 126 TFLOPS dense
+  bf16. FlashInfer runs two CTAs per SM. `torch.cuda.get_device_properties()` before
+  choosing constants. A chunk tile at head_dim 512 is heavy on shared memory (a 32-key
+  K+V leaf is 64 KB); count before you size.
+
+- A candidate landing on a measured ceiling is a reason to re-derive what the ceiling
+  assumed (one launch at a time, steady state), not to stop.
+
+- Not this target, but a question for the record: the sliding kind will later run image
+  chunks under a blockwise-bidirectional mask inside the window. Note whether your
+  design could take a custom mask.
+"""
+
+[task.repo]
+path = "../examples/gemma-attn"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs, 24 MiB L2)"

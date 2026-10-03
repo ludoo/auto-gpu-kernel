@@ -1,0 +1,9 @@
+# gemma-attn — gemma's attention made one class (sparkle task next.120)
+
+Gemma 4 12B's two attention geometries on the DGX Spark: 40 sliding layers (16 q / 8 kv heads, head_dim 256, a 1024-key window over a gathered page ring) and 8 global layers (16 q / 1 kv head, head_dim 512, the whole sequence). The engine runs each at 1 row (decode), 4 (verify), 1–3 (eager verify) and up to 4096 (a prefill chunk), and requires a row's output bytes to be a function of the row alone. FlashInfer's paged prefill kernel is not: its kv-tile grid is anchored at the q tile's window start, its CTA_TILE_Q moves with the row count, and ~1% of rows move with the tile they ride in. This target replaces it with a kernel that holds the invariant at the wheel's price.
+
+- `gemma_attn.py` — the op: `gemma_attention(q, pages, qo_indptr, kv_indptr, kv_indices, kv_last_page_len, pos_base, window_left, out)`. The starting point is the slowest kernel that holds the contract by construction (one program per row and kv head, an absolute leaf grid, the fold in registers); only this file changes.
+- `shapes.py`, `data.py` — the two geometries, the metadata contract, seeded sequences on a permuted paged cache.
+- `reference.py` — the fp32 reference (the correctness side) and the wheel (the bench baseline and the correctness comparator; not the contract).
+- `test_attn.py` — invariance bitwise over every arm the engine runs (whole, chunked at five splits, 1-row, 4-row, 1/2/3-row, two sequences in a launch, long-context tails at 32k and 128k), correctness within twice the wheel's rel-L2 from fp32, determinism, CUDA-graph replay with rewritten metadata.
+- `bench.py` — `attn_score`: the geomean over 12 cells (both kinds; decode, verify, chunk; kv 4k/32k/128k on the global kind) of per-call µs over the wheel's; 1.0 is par, lower is better.
