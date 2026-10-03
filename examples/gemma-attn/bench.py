@@ -39,7 +39,7 @@ from reference import wheel_wrapper
 from shapes import BENCH_CELLS, KINDS, PAGE, QUICK_PHASES, WINDOW
 
 # FlashInfer's plain plans through this bench (`--wheel`, permuted
-# pages, rotated sets) on this box, 2026-10-04, median per-call µs. The
+# pages, rotated sets) on this box, 2026-10-03, median per-call µs. The
 # same plans on an `arange` page table run 2-15% faster at decode and
 # verify (sparkle docs/history/archive/next120/attention_floor.log).
 BASELINE_US = {
