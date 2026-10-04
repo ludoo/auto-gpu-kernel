@@ -1,0 +1,130 @@
+# Gemma 4 12B's W4A16 linear on the DGX Spark (GB10, sm_121) — sparkle task
+# next.120, kopt target 10, round 2: the decode end of the first round's
+# survivor, from 1.10–1.22 of the wheel's Marlin to par.
+#
+#   kopt init-task configs/w4a16_decode.toml work/w4a16-decode-<model> --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/w4a16-decode-dsflash -n 8 --budget 10 --model deepseek/deepseek-flash --thinking medium
+
+[task]
+name = "w4a16-decode"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make the DECODE path of `w4a16_gemm(x, packed, scale, out)` in w4a16_gemm.py — the
+tile taken when M <= 16, i.e. M = 1 (decode) and M = 4 (verify) — reach the wheel's
+Marlin price (bench.py's BASELINE_US) on gemma's six linear shapes, while holding the
+contract test_w4a16.py states (bitwise invariance of a row's bytes across M and
+position; correctness within twice the wheel's rel-L2 from an fp32 reference).
+
+The starting kernel is the first round's survivor. Its K fold is one fp32 accumulator
+threaded through `tl.dot` in ascending leaf order, identical at every M, and that fold
+is the whole contract: the prefill tile (M > 16) computes the same chain, and the tests
+compare decode rows against a 4096-row call bitwise. The PREFILL PATH IS FROZEN this
+round: do not change the tiles `PREFILL`, `PREFILL_DEEP`, `DEEP_K`, the `WT` unpack or
+the grid for M > 16 — the chunk cells are not scored here and were measured in round 1
+(the 18-cell bench in the sibling example is re-run on your survivor afterwards; a
+regression there is a failed candidate). Any new decode mechanism must keep the fold:
+one accumulator per output element, K ascending, no second accumulator, no split-K
+merge (a fixed split-K was priced in round 1: −55% on the chunk — it cannot be used at
+decode alone because the fold must equal the chunk's).
+
+Where the start sits (µs, candidate / wheel at M=1, M=4): q_proj 48.6/41.1 and
+45.9/40.4; k_proj_sliding 28.7/23.8 and 27.3/23.9; k_proj_global 14.8/15.5 and
+14.6/15.6 (already under); o_proj 44.8/39.7 and 44.9/41.7; gate_up 152/136 and
+155/138; down 151/137 and 154/135. The wheel streams the 33 MB shapes at 241–245 GB/s
+(the DRAM ceiling on this part is ~237–250), the 8.8 MB shapes at 215–223, the 4.4 MB
+one at 186; the start streams them at ~200–215. The gap is 10–20% of bytes-per-second
+on a kernel that is pure weight streaming (the x slab is L2-resident, the mma is idle).
+
+Only w4a16_gemm.py may change (you may add helper modules it imports). shapes.py,
+data.py, reference.py, test_w4a16.py and bench.py are read-only. No cuBLAS /
+torch.matmul on the main path and no torch.compile. The engine replays this call under
+CUDA graphs at M = 1 and 4: a plain launch (or a fixed short sequence of launches) with
+no host sync and no data-dependent host work; M is a runtime int; no runtime
+autotuning — constants chosen statically per (N, K), measured, then fixed.
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `gemm_score` (lower is
+better): the geometric mean over 12 cells (six shapes × M in {1, 4}) of (median
+per-call µs / the wheel's Marlin µs on this box). 1.0 is par. Each cell rotates over
+distinct weights whose bytes exceed 4x L2 and times 20 back-to-back calls between CUDA
+events — a chain, as the engine's step is (seven GEMMs a layer, 48 layers, under a CUDA
+graph) — so the figure is cold and the call boundary is inside the timed region. The
+start scores 1.10. Run-to-run spread is ~1–2%; use A/B for small deltas.
+"""
+validate = """
+Run `python -m "pytest
+
+🔮 View transcript: https://agentlogs.home.qix.it/s/w6znhlbez6mv954wh25bw8of" -q` in the repo; every test must pass (97 tests, ~5 s).
+Invariance is BITWISE on every arm — decode rows at every offset against the 4096-row
+whole, which runs the frozen prefill tile, so any decode change that moves a byte
+fails; correctness within twice the wheel's rel-L2 from fp32; determinism; CUDA-graph
+capture and replay at M = 1 and 4 with x rewritten; no torch matmul on the path. Do
+not edit the tests; a candidate that needs them changed is wrong.
+"""
+hints = """
+What two loops on this kernel already measured (do not repeat), and the questions left:
+
+- Converged, measured null or worse at the decode tile (4, 16, 256, warps 4, stages 3):
+  BM 1/2/8/16/32/64; BN 32/64 (except q_proj, which takes BN 32); BK 64/128 and every
+  stage count but 3 at BK 256; 8 warps; `loop_unroll_factor` 2/4;
+  `disallow_acc_multi_buffer`; `disable_licm`; the weight as the mma's A operand; an
+  x-load transpose; `tl.range` stages; `.cg` / `evict_last` cache modifiers; N-coarsening
+  (two or four column slabs per program with independent accumulators: 1.72 / 1.97
+  against 1.24 — worse); cheaper dequant arithmetic (bf16 / int8 / integer subtract:
+  within noise of the fp32 path). ncu at the start: 3 blocks per SM, 156 registers, no
+  spills, 1.67 waves, ~80% of cycles with no eligible warp, top stall the L1TEX
+  scoreboard — a latency-bound stream, not an ALU- or occupancy-bound one.
+
+- The question is bytes in flight per SM. At 237 GB/s and ~1 µs of DRAM latency the
+  chip needs ~240 KB outstanding; a program at BN 16, BK 256, 3 stages holds 3 × 2 KB of
+  weight — with ~5 resident programs per SM that is ~30 KB per SM, which should suffice
+  on paper and does not in practice: ask what serialises the loads. Each leaf issues 16
+  rows × 128 B of weight as 16 separate segments plus the x leaf; the unpack (shift,
+  mask, convert, scale, transpose) sits between the load and the dot on every leaf. Does
+  the pipeline actually keep 3 weight stages in flight, or does the dequant's register
+  pressure (156 regs) collapse it? `triton.compile` → `.asm['ptx']`/`ttgir` shows the
+  stage count the pipeliner achieved; ncu's `smsp__warps_issue_stalled_long_scoreboard`
+  and `l1tex__t_bytes_pipe_lsu_mem_global_op_ld` per leaf say what is in flight.
+
+- The x operand is tiny (M ≤ 4 rows × K bf16, 30–120 KB) and re-read every leaf by every
+  program from L2 — it is a quarter of the load instructions for no DRAM bytes. Can the
+  x leaf be loaded once per stage for a wider K span, or can the stage carry two leaves
+  of weight per x load (same fold: two dots in order)? Measure, do not assume.
+
+- The call boundary is inside the timed chain, as it is in the engine's step. Sparkle's
+  M-invariant bf16 thin GEMM (a similar 7 MB weight stream, the same box) went under its
+  own measured "ceiling" with programmatic dependent launch: `launch_pdl=True` on the
+  launch, `tl.extra.cuda.gdc_wait()` before the first global load and
+  `tl.extra.cuda.gdc_launch_dependents()` after the last dot (−5.7% on a 96-call chain;
+  releasing the successor before the dots cost 1.7 µs because it then competes for
+  bandwidth). Ordering is preserved: only a successor also launched with PDL starts
+  early. The bench chains 20 calls of the same kernel, so this shows here if it works on
+  triton 3.7.1 / sm_121; the engine's chain interleaves other kernels, so the per-call
+  gain there is smaller — still, measure it.
+
+- The weight is read exactly once per call; `evict_first` is already on. The wheel's
+  Marlin reaches 241 GB/s on the 33 MB shapes with a 4-stage cp.async pipeline of
+  16×64-column tiles; its decode kernel is a GEMM template with a small-batch path, not
+  a GEMV — the stripe pattern (how many programs, how much K each walks) is the thing to
+  reason about, not the arithmetic.
+
+- The small shapes are different problems: k_proj_global (512 × 3840, 1.1 MB) is
+  already under the wheel (0.94–0.96) and is latency-floored at ~15 µs on both; k_proj
+  sliding (2048 × 3840, 4.4 MB) at 1.14–1.21 has only 128 programs at BN 16 — 2.7 per
+  SM — so it is the shape where the per-program bytes in flight matter most, and a
+  per-(N, K) table entry is allowed (the shape is static).
+
+- The part: 48 SMs, 24 MiB L2, ~237 GB/s, sm_121, triton 3.7.1 on torch 2.13. Check
+  every configuration you time against the whole the way the tests do, in the
+  foreground, before logging a number; the fold is the same whatever the tile, but a
+  new code path (a second kernel, an epilogue) must be re-checked.
+"""
+
+[task.repo]
+path = "../examples/w4a16-decode"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs, 24 MiB L2)"
