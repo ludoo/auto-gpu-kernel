@@ -102,15 +102,19 @@ What has been measured on this box, and what the invariant forbids:
   part): (1) `tl.dot(A, B, acc=C) != tl.dot(A, B) + C` — the mma's accumulate is not an
   IEEE fp32 add, so a fold threaded through the mma's C operand at one M cannot be
   reproduced by merging zero-start partials at another; (2) `tl.dot(A, B, acc=0) ==
-  tl.dot(A, B)` is exact; (3) the K width of each `tl.dot` (the leaf) IS in the fold —
-  a 64-wide dot and two 32-wide dots give different bytes; (4) on sparkle's bf16 thin
+  tl.dot(A, B)` is exact; (3) the K width of each `tl.dot` (the leaf) is NOT in the
+  fold on this part when the accumulator is threaded through: one 256-wide dot and
+  eight 32-wide dots in order give the same bytes (measured on this harness, 97 tests
+  and three seeds, BK 32 vs 128 vs 256) — what is in the fold is the accumulator
+  chain: one fp32 accumulator per output element, K ascending, no second
+  accumulator, no merge; (4) on sparkle's bf16 thin
   GEMM the tile (BM, BN, num_warps, num_stages) was NOT in the fold across 81 variants,
   but on its attention kernel `num_warps` WAS on one geometry — a warp layout can move
   an mma's internal order by an ulp in 1 in 25k elements. Check every configuration you
   time against the whole the way the tests do, in the foreground, before logging a
   number; a broken variant shows in a handful of rows. So: the K order per output
   element must be identical at M = 1 and at M = 4096. Options that hold it: one
-  accumulator over all of K in leaf order (the start); a FIXED split-K — the same P
+  accumulator over all of K in leaf order (the start; the leaf width free per tile); a FIXED split-K — the same P
   zero-start partials over the same K ranges at every M, merged in the same order with
   IEEE fp32 adds (a second kernel or a fixed epilogue) — which buys parallelism at
   decode and costs M×N×P×4 bytes of partial traffic at the chunk; or a per-shape choice
