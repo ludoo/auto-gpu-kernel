@@ -1,0 +1,147 @@
+# Gemma 4 12B's W4A16 linear on the DGX Spark (GB10, sm_121) — sparkle task
+# next.120, kopt target 10: one int4 weight-only GEMM for every linear in the
+# model whose output bytes are a function of the row and the weight alone, at
+# the wheel's Marlin price at both ends.
+#
+#   kopt init-task configs/w4a16_gemm.toml work/w4a16-gemm-<model> --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/w4a16-gemm-dsflash -n 10 --budget 10 --model deepseek/deepseek-flash --thinking medium
+#   kopt run work/w4a16-gemm-opus5 -n 12 --budget 60 --model anthropic/claude-opus-5 --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1, the
+# vLLM wheel for the baseline, pytest), so the kernel is developed on the
+# stack it ships in.
+
+[task]
+name = "w4a16-gemm"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make `w4a16_gemm(x, packed, scale, out)` in w4a16_gemm.py fast on this GPU — at par
+with the wheel's Marlin W4A16 GEMM (bench.py's BASELINE_US) at every cell: M = 1
+(decode), M = 4 (verify) and M = 4096 (the prefill chunk) on gemma's six linear shapes
+(shapes.py: N×K = 4096×3840, 2048×3840, 512×3840, 3840×4096, 15360×3840, 3840×15360) —
+while holding the contract test_w4a16.py states:
+
+1. INVARIANCE, BITWISE. A row's output bytes are a function of the row (its activation)
+   and the weight alone — never of how many rows were in the call or where the row sat
+   in it. The tests compute every row of a 4096-row activation whole, then in calls of
+   M rows at three offsets for M in {1, 2, 3, 4, 17, 64, 65, 128, 1536}, and the whole
+   in 17-row and 64-row pieces, and require equal bytes. No tolerance exists or may be
+   added.
+2. CORRECTNESS, within bf16 rounding of an fp32 reference: on the whole and on the
+   small arms the rel-L2 distance from `x.float() @ dequant(W).float().T` is at most
+   twice the wheel's own (~2.2e-3 on every shape).
+
+The operands are the checkpoint's: packed int32 [N, K/8] with eight bias-8 nibbles per
+word, LSB-first along K (element k of row n is nibble k % 8 of word k // 8: `(word >>
+(4 * (k % 8))) & 0xF`, minus 8), bf16 scales [N, K/32] (group 32), x bf16 [M, K], out
+bf16 [M, N]. No repack is allowed: the kernel reads this layout (a load-time
+re-layout of the weight into another resident copy is not on offer — the engine keeps
+one weight copy).
+
+The starting kernel holds the contract by construction and is slow: one program per
+(16-row, 64-column) tile, the K walk in 32-wide leaves (one scale group) in ascending
+order, each leaf's weight unpacked and dequantized to bf16 in registers, `tl.dot` with
+one fp32 accumulator threaded through the leaves, one rounding at the end, no split-K,
+no real pipelining. The contract is the only thing it has; everything else is yours.
+
+Only w4a16_gemm.py may change (you may add helper modules it imports). shapes.py,
+data.py, reference.py, test_w4a16.py and bench.py are read-only. No cuBLAS /
+torch.matmul on the main path and no torch.compile. The engine replays this call under
+CUDA graphs at M = 1 and 4: a plain launch (or a fixed short sequence of launches) with
+no host sync and no data-dependent host work; M is a runtime int (`do_not_specialize`
+or equivalent — the prefill row count varies chunk to chunk), no runtime autotuning —
+constants chosen statically per (N, K) and, if you like, per a rule on M, measured,
+then fixed. Per-call workspace allocations through torch are fine; shape-keyed caches
+keyed on M are not.
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `gemm_score` (lower is
+better): the geometric mean over 18 cells (six shapes × M in {1, 4, 4096}) of (median
+per-call µs / the wheel's Marlin µs on this box). 1.0 is par with the wheel; every
+cell weighs equally, so winning decode and losing the chunk does not win. Quick mode
+(`--quick`) runs the M = 1 and 4 cells only. Each cell rotates over distinct weights
+whose bytes exceed 4x L2, so the figure is cold — at M ≤ 4 the weight is the working
+set and one weight per shape would measure the cache. The wheel's figures (µs, M=1 /
+M=4 / M=4096): q_proj 41 / 40 / 1388; k_proj_sliding 24 / 24 / 708; k_proj_global
+15.5 / 15.6 / 231; o_proj 40 / 42 / 1377; gate_up 136 / 138 / 8474; down 137 / 135 /
+5038. The naive starting kernel scores 4.11: 2.1–3.4x at M ≤ 4, 6.8–12.2x at the chunk.
+"""
+validate = """
+Run `python -m "pytest
+
+🔮 View transcript: https://agentlogs.home.qix.it/s/w6znhlbez6mv954wh25bw8of" -q` in the repo; every test must pass (97 tests, ~5 s on the
+starting kernel). Invariance is BITWISE on every arm; correctness is within twice the
+wheel's rel-L2 from fp32; determinism over 8 calls; CUDA-graph capture and replay at
+M = 1 and 4 with x rewritten between replays; no torch matmul on the path; bad
+operands rejected with ValueError. Do not edit the tests; a candidate that needs them
+changed is wrong.
+"""
+hints = """
+What has been measured on this box, and what the invariant forbids:
+
+- Where the wheel sits (sparkle's floor probe, cold rotated). At M ≤ 4 Marlin streams
+  the 33 MB shapes (gate_up, down) at 241–245 GB/s — the DRAM ceiling on this part is
+  ~237–250 — the 8.8 MB shapes (q_proj, o_proj) at 215–223, k_proj_sliding (4.4 MB) at
+  186, and k_proj_global (1.1 MB) at 71 GB/s in 15.5 µs: the small shapes are
+  latency-bound, not bandwidth-bound, so par there is a short critical path with many
+  bytes in flight, not a wider stream. At M = 4096 Marlin runs 91–96 TFLOPS on four
+  shapes, 70 on k_proj_global and 57 on gate_up (its loosest cell; the dense bf16
+  peak measured on this part is 126 TFLOPS, cuBLAS bf16 reaches ~100). So decode is a
+  bandwidth problem with a latency floor on the small shapes; the chunk a tensor-pipe
+  problem where the dequant sits in the inner loop.
+
+- Why the wheel fails the contract (sparkle's probe, read on the box): Marlin picks its
+  thread configuration by M — a small-batch path at ≤ 16 rows, an SM-count override at
+  one full 64-row part, k-slicing (thread blocks splitting K and merging partials) from
+  two parts up — and the row's bytes are the reduction order over K. Each is a thing
+  the invariant forbids, not a mechanism to copy.
+
+- The arithmetic that is exact by construction (sparkle next.75 and next.89, on this
+  part): (1) `tl.dot(A, B, acc=C) != tl.dot(A, B) + C` — the mma's accumulate is not an
+  IEEE fp32 add, so a fold threaded through the mma's C operand at one M cannot be
+  reproduced by merging zero-start partials at another; (2) `tl.dot(A, B, acc=0) ==
+  tl.dot(A, B)` is exact; (3) the K width of each `tl.dot` (the leaf) IS in the fold —
+  a 64-wide dot and two 32-wide dots give different bytes; (4) on sparkle's bf16 thin
+  GEMM the tile (BM, BN, num_warps, num_stages) was NOT in the fold across 81 variants,
+  but on its attention kernel `num_warps` WAS on one geometry — a warp layout can move
+  an mma's internal order by an ulp in 1 in 25k elements. Check every configuration you
+  time against the whole the way the tests do, in the foreground, before logging a
+  number; a broken variant shows in a handful of rows. So: the K order per output
+  element must be identical at M = 1 and at M = 4096. Options that hold it: one
+  accumulator over all of K in leaf order (the start); a FIXED split-K — the same P
+  zero-start partials over the same K ranges at every M, merged in the same order with
+  IEEE fp32 adds (a second kernel or a fixed epilogue) — which buys parallelism at
+  decode and costs M×N×P×4 bytes of partial traffic at the chunk; or a per-shape choice
+  of either, since (N, K) is static and M is not. A rule may read M to choose the TILE
+  (a thin tile at M ≤ 16, a wide one above), never the fold.
+
+- The dequant: scales are per 32-K group, so a 32-wide leaf is one scale per column;
+  wider leaves need the scale per sub-group. (nibble − 8) × scale in fp32 rounded once
+  to bf16 equals the bf16 product (both are exact products rounded once); the
+  reference's fp32 bound has ~1e-4 of slack over the wheel, not more. The unpack is
+  integer work on the critical path of every leaf: at the chunk it is the thing between
+  you and the mma rate, at decode it is nothing. Consider unpacking a word's 8 nibbles
+  with shifts and masks into an int8/fp16 path, or interleaving so that a 32-bit word's
+  nibbles land in the mma's K order without a reshape.
+
+- Decode is 16-row-padded mma on 1 or 4 real rows: the pad is free (the pipe is idle);
+  what matters is bytes in flight per SM — a program that owns a 64- or 128-column
+  slab of all K with 3–4 stages of 32×64 words outstanding, 48 SMs, and the weight read
+  exactly once with `eviction_policy='evict_first'`. The shapes with N/BN < 48 programs
+  (k_proj_global: 512 columns) cannot fill the part without split-K; that is where the
+  fixed-P fold earns its traffic.
+
+- The part: 48 SMs, 24 MiB L2, ~237 GB/s, sm_121, triton 3.7.1 on torch 2.13. No
+  autotuning at runtime, no torch.compile, no host sync. A candidate landing on a
+  measured ceiling is a reason to re-derive what the ceiling assumed (one launch at a
+  time, steady state), not to stop.
+"""
+
+[task.repo]
+path = "../examples/w4a16-gemm"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs, 24 MiB L2)"
