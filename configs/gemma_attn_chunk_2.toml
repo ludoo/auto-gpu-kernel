@@ -1,0 +1,190 @@
+# Gemma 4 12B's paged attention at the prefill chunk on the DGX Spark (GB10,
+# sm_121) — sparkle task next.130, kopt target 12, ROUND 2: the global kind's
+# 4096-row chunk from ~34 TFLOPS towards the part's 126, with every other cell
+# held. Round 1 (configs/gemma_attn_chunk.toml) tuned the structure to its
+# measured end; this round asks for a structure.
+#
+#   kopt init-task configs/gemma_attn_chunk_2.toml work/gemma-attn-chunk-2-dsflash --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/gemma-attn-chunk-2-dsflash -n 12 --budget 10 --model deepseek/deepseek-flash --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1,
+# flashinfer, pytest), so the kernel is developed on the stack it ships in.
+
+[task]
+name = "gemma-attn-chunk-2"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make the 4096-row prefill chunk of `gemma_attention(...)` in gemma_attn.py fast on the
+GLOBAL kind (shapes.py: 16 q heads on 1 kv head, head_dim 512, causal over the whole
+sequence, kv 8k / 32k / 60k) — it runs at ~32 TFLOPS against this part's measured 126
+TFLOPS dense bf16 peak — while every other cell (decode, verify, the sliding kind) keeps
+its price or better, and while holding the contract test_attn.py states:
+
+1. INVARIANCE, BITWISE. A row's output bytes are a function of the row alone (its
+   query, the keys it may attend, its position, the window, its image span) — never of
+   how many rows were in the call, where the call started, which tile the row rode in,
+   how many keys sat past it, or which other sequences shared the launch. The tests
+   compute every row of a 1600-position sequence whole, chunked at five splits, one row
+   at a time, four at a time, 1/2/3 at a time, two sequences per launch, long-context
+   tails at 32k and 128k, and the image-span arms on the sliding kind, and require equal
+   bytes. No tolerance exists or may be added.
+2. CORRECTNESS, within bf16 rounding of an fp32 reference: on every arm the rel-L2
+   distance from reference.py's fp32 attention is at most twice the wheel's own.
+
+The starting kernel is the previous round's survivor: sparkle's served kernel plus a
+fixed block-grain fold on the global kind (a block's softmax scale is its first leaf's row
+max, the other leaves accumulate through the mma's C operand) and an L2-residency rule
+for the fused path's pipeline depth. It holds the contract on every arm and is the thing
+to beat. Its docstring is the design and its fold is NOT sacred:
+the contract is that every path the engine runs — the fused chunk and the split
+decode/verify — performs the same arithmetic in the same order for a given row, not
+that it performs today's. A new fold (a different leaf grain, block grain, warp layout,
+or a new structure altogether) is admissible if every path shares it and the tests are
+green; the chunk may have its own kernel instantiation (its own row tile, its own
+pipeline) as long as the per-row arithmetic is the fold's.
+
+Only gemma_attn.py may change (you may add helper modules it imports). shapes.py,
+data.py, reference.py, test_attn.py and bench.py are read-only. No torch attention /
+matmul / softmax on the main path and no torch.compile. The engine replays this call
+under CUDA graphs at decode and verify: a plain launch (or a fixed short sequence of
+launches) with no host sync, no data-dependent host work (the metadata is read on
+device — `qo_indptr` and friends are device int32 tensors rewritten between replays;
+only shapes, `window_left` and the row count are static), no runtime autotuning —
+constants chosen statically (a rule on the row count is fine), measured, then fixed.
+Per-call workspace allocations through torch are fine; shape-keyed caches are not (the
+prefill row count varies chunk to chunk).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `chunk_score` (lower is
+better): the geometric mean over the three SCORED cells — the global kind's 4096-row
+chunk at kv 8192, 32768 and 61440 (a 65k prompt's chunk 1, mean chunk and last full
+chunk) — of median per-call µs over the starting kernel's, multiplied by the geometric
+mean over the nine HELD cells (sliding decode / verify / chunk at 32k; global decode and
+verify at 4k / 32k / 128k) of max(1.0, µs over the start's). The start scores 1.0. A
+held cell cannot lower the score; a slower held cell raises it, so winning the chunk by
+losing decode does not win. `--quick` runs the three scored cells only (~10 s); the
+full bench is ~1 min. Each cell rotates its inputs over sets exceeding 4x L2, so the
+figure is cold. Noise on the scored cells is ~1% run to run; A/B anything under 3%.
+
+The start's scored cells: 23.8 / 126.0 / 244.6 ms. Their FLOP floors at 126 TFLOPS
+(4 · 16 heads · 512 · causal pairs): 6.5 / 32.7 / 63.3 ms — a score of 0.27 is the
+peak, 0.53 is half the peak. The wheel's own head_dim-512 chunk template runs these at
+22.7 / 122.8 / 236.7 ms, ~35 TFLOPS: it is not the floor and not the target; it is
+printed beside each cell for the record and enters nothing. The start's kernel with
+every K/V address forced L1-resident (a probe, not a kernel) runs the 8k cell in
+8.3 ms: that is how much of the 23.8 is the memory path serialised with the compute.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass (45 pass, 7 skip — the span
+arms on the global kind — ~5 s on the start). Invariance is BITWISE on every arm;
+correctness is within twice the wheel's rel-L2 from fp32; the image-span contract on the
+sliding kind; determinism over 8 calls; CUDA-graph capture and replay at rows 1 and 4
+with the metadata rewritten between replays; no torch attention op on the path. Do not
+edit the tests; a candidate that needs them changed is wrong. Run validate after EVERY
+change to the fold, however small: the previous loop on this kernel found a warp-layout
+change moves one element in 25k by an ulp, and its own hand-written bitwise probe
+reported EQUAL on every broken variant — only the suite's volume caught them.
+"""
+hints = """
+What has been measured on this box and on THIS kernel (round 1, twelve logged
+experiments, the record in experiments/ of work/gemma-attn-chunk-dsflash), and what the
+invariant forbids. Each hint is a claim measured on the start; a hint owes its probe on a
+new structure before it is believed. The closed axes are listed so no iteration re-sweeps
+them: the question this round is funded to answer is below them.
+
+- WHERE THE TIME IS. ncu on the fused global chunk: 248 registers per thread (of 255),
+  occupancy 1 CTA per SM limited by shared memory AND by registers, 1.99 active warps per
+  scheduler, 0.14 instructions issued per scheduler per cycle (15% of slots), stalls
+  long_scoreboard 4.7 / short_scoreboard 2.9 / wait 2.8 / math_pipe_throttle 0.9 /
+  barrier 0.8 per issue. Memory throughput 56%, SM throughput 42%, tensor 18% of
+  instructions. The kernel is latency-bound with one CTA resident; the loads are
+  serialised with the compute because nothing else is resident to overlap them. With
+  every K/V address forced L1-resident the 8k cell runs in 8.3 ms, so the memory path is
+  ~2/3 of the runtime. L2 read ceiling measured ~1.9 TB/s resident; the chunk pulls ~1.
+
+- THE WALL, WITH NUMBERS. The global tile is 2 rows x 16 heads = M 32 (the group heads
+  are the mma's M; one kv head). Triton stages the dot's A operand (q, [32, 512] bf16 =
+  32 KB) in shared memory, K and V leaves of 32 keys are 32 KB each: 100352 B of the
+  101376 B limit, so there is no second pipeline stage at LEAF 32 and no second CTA.
+  `acc` [32, 512] fp32 is 64 registers per thread at 8 warps; q's fragments, s, p and
+  the address math take the rest to 248. A 4-row tile (M 64) needs LEAF 16 to fit smem
+  and spills its accumulator at 4 or 8 warps (2.5x slower). The wheel's head_dim-512
+  template runs two CTAs per SM and is 3-7% ahead; its advantage is largest where the
+  gather is L2-resident (8k), i.e. exactly where latency, not DRAM, is the limit.
+
+- CLOSED AXES (measured on the start, interleaved in one process, the paired A/B as
+  arbiter): rows_tile 1 / 2 / 4; LEAF 16 / 32 (16 pipelines but doubles the leaf count,
+  +40% at 32k); num_warps 4 / 8 / 16; num_stages 1-6 (1 wins only when the gather fits
+  L2, the start's rule); BLOCK 256-512 (the chunk gains 0.4% per 64 keys, the 4k
+  decode/verify cells lose 4% per 64 keys through the split path's chain length — the
+  BLOCK axis is a fold/split duality and nets zero through the held cells); DSPLIT on
+  the fused path (recomputes QK, 43 vs 26 ms); K loaded as two D-halves with chained
+  dots (bitwise-equal, +1-4%); contiguous K/V staging (the gather is not the cost);
+  `evict_last` (+0.5% on the A/B); the page-id gather one leaf ahead (net +0.9%); a
+  shared per-row scale from a pre-pass (the pre-pass's q re-read costs what the peel
+  saved). A rule keyed on `kv_indices.shape[0]` for anything IN the fold is illegal: the
+  graph test pads that buffer, so the padded call and the trimmed call must fold alike
+  (round 1's exp_005 failed the gate on exactly this; a rule on it for num_stages is
+  fine because num_stages is not in the fold on the global kind).
+
+- THE QUESTION. Two CTAs per SM need under ~50 KB of shared memory and under 128
+  registers per thread each; the alternative is one CTA whose loads are not serialised
+  with its compute. Neither is reachable by the start's structure — one program holding
+  q [32, 512] staged, a 32-key K and V leaf, and acc [32, 512] fp32 — at head_dim 512.
+  What structure gets there while every path the engine runs performs the same per-row
+  arithmetic? Things that change the structure rather than its constants, none of them
+  measured: splitting the head dimension of the QK contraction across programs is NOT
+  exact (the scores' sum order changes), but splitting V's output columns IS and the
+  start already does it on the split path (DSPLIT) — the recompute of QK is what made it
+  lose on the fused path, so the question is whether the recompute can be shared (two
+  CTAs on one SM reading the same K leaf; a cluster; p written once and read by a
+  column-half consumer) rather than repeated; the 16 heads share one K/V and need not
+  share one program — a program per 8 heads (M 16 at 2 rows, or M 32 at 4 rows) halves
+  q's staging and acc per program and doubles the K/V re-reads, which L2 serves; a
+  warp-specialised loop (producer warps on the loads, consumer warps on the mma) is the
+  wheel's shape and is the one way to overlap within one CTA at this smem budget —
+  Triton 3.7 on this part exposes it only through its pipeliner, so it is a measurement
+  whether the compiler produces it at LEAF 32 with q in registers rather than staged. The
+  fold constraint on every one of these: the per-row sequence of fp32 operations must be
+  the one the split path performs at decode and verify — so a leaf's QK dot, its mask,
+  its exp2 against the block's scale, its P.V dot and the block combine stay as they
+  are, and what moves is which program does them and when.
+
+- THE ARITHMETIC THAT IS EXACT BY CONSTRUCTION (sparkle next.75's probes, on this part):
+  `dot(P, V, acc=C) != dot(P, V) + C` (the mma accumulate is not an IEEE add, ~50% of
+  elements); the zero-start `dot(P, V, acc=0) == dot(P, V)` is exact; a max is exactly
+  associative, a sum is not; rows of a tile do not interact in the mma. The fold's
+  membership on this kernel, measured: LEAF, BLOCK and num_warps are in the fold (a warp
+  layout moves the mma's reduction order by an ulp in 1 of 25k elements); num_stages is
+  not on the global kind; the row tile, DSPLIT and DCHUNK are not. The start's fixed
+  block-grain fold on the global kind: the block's scale is its first leaf's row max,
+  floored at -100 and the exponent capped at +100, so a masked first leaf yields p = 0
+  exactly; the sliding kind keeps the online leaf fold (its window admits a masked first
+  leaf with an attended later one). Its hand-written bitwise probes reported EQUAL on
+  broken variants that the suite caught: run the suite after every change to the fold.
+
+- THE SLIDING KIND is a HELD cell (62 ms of a chunk against the global kind's 1.1 s).
+  Do not spend iterations on it. Its key index space is the GATHER (`pos_base + j`) and
+  its image-span mask rides in `_tile_geometry` as a per-row `reach`; the span tests gate
+  any change to the shared helpers.
+
+- THE PART: 48 SMs, sm_121, 24 MiB L2, ~237-250 GB/s practical read, 126 TFLOPS dense
+  bf16 (measured; the 213 in circulation is the sparse rung). 101376 B shared memory per
+  CTA, 64K registers per SM. `torch.cuda.get_device_properties()` before choosing
+  constants; read the PTX/TTGIR under `TRITON_CACHE_DIR` to see what the compiler
+  actually staged and pipelined — round 1 found the smem wall there, not in the docs.
+
+- A candidate landing on a measured ceiling is a reason to re-derive what the ceiling
+  assumed (one launch at a time, one resident CTA, steady state), not to stop. Measure
+  cold and interleaved, A/B anything under 3%, one change per iteration, log the
+  negatives. A null on a structure is a result: write what it measured and why.
+"""
+
+[task.repo]
+path = "../examples/gemma-attn-chunk-2"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs, 24 MiB L2, 99 KB smem per CTA)"
