@@ -35,9 +35,13 @@ owns how the generated validation and benchmark adapters are executed and compar
 
 ## When stuck
 
-Use the profiler when the next change depends on locating the dominant phase. Use the
-research agent after a real plateau, repeated validation failures, or when the proposed
-idea resembles an earlier failure. These agents read the on-disk experiment record.
+Use the profiler when the next change depends on locating the dominant phase. After a
+real plateau, repeated validation failures, or when the proposed idea resembles an
+earlier failure, re-read the on-disk experiment record (`experiments/summary.md`,
+`LESSONS.md`, the last three `exp_N/`) before proposing anything, as a fresh reader
+would. A `research` subagent exists in `.pi/subagents/` but the loop runs with no
+background-task extension (a turn that ends waiting on a child is counted as a stall),
+so if no `subagent` tool is available, do the clean-context read yourself.
 
 If profiling needs temporary instrumentation, revert it before the logged kbench run or
 make the instrumentation itself the single explicit experiment.
