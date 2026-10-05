@@ -1,0 +1,160 @@
+# Gemma 4 12B's paged attention at the prefill chunk on the DGX Spark (GB10,
+# sm_121) — sparkle task next.130, kopt target 12: the global kind's 4096-row
+# chunk, the only bucket of a prefill chunk that grows with context, from
+# ~32 TFLOPS towards the part's 126, with every other cell held.
+#
+#   kopt init-task configs/gemma_attn_chunk.toml work/gemma-attn-chunk-dsflash --agent pi \
+#       --extension ~/.pi/agent/npm/node_modules/@gotgenes/pi-anthropic-auth
+#   kopt run work/gemma-attn-chunk-dsflash -n 12 --budget 10 --model deepseek/deepseek-flash --thinking medium
+#
+# `path_prepend` is sparkle's own venv (torch 2.13 cu130, triton 3.7.1,
+# flashinfer, pytest), so the kernel is developed on the stack it ships in.
+
+[task]
+name = "gemma-attn-chunk"
+workdir = "repo"
+path_prepend = "/home/ludo/dev/kb-vault/code/sparkle/.venv/bin"
+objective = """
+Make the 4096-row prefill chunk of `gemma_attention(...)` in gemma_attn.py fast on the
+GLOBAL kind (shapes.py: 16 q heads on 1 kv head, head_dim 512, causal over the whole
+sequence, kv 8k / 32k / 60k) — it runs at ~32 TFLOPS against this part's measured 126
+TFLOPS dense bf16 peak — while every other cell (decode, verify, the sliding kind) keeps
+its price or better, and while holding the contract test_attn.py states:
+
+1. INVARIANCE, BITWISE. A row's output bytes are a function of the row alone (its
+   query, the keys it may attend, its position, the window, its image span) — never of
+   how many rows were in the call, where the call started, which tile the row rode in,
+   how many keys sat past it, or which other sequences shared the launch. The tests
+   compute every row of a 1600-position sequence whole, chunked at five splits, one row
+   at a time, four at a time, 1/2/3 at a time, two sequences per launch, long-context
+   tails at 32k and 128k, and the image-span arms on the sliding kind, and require equal
+   bytes. No tolerance exists or may be added.
+2. CORRECTNESS, within bf16 rounding of an fp32 reference: on every arm the rel-L2
+   distance from reference.py's fp32 attention is at most twice the wheel's own.
+
+The starting kernel is sparkle's served kernel verbatim; it holds the contract on every
+arm and is the thing to beat. Its docstring is the design and its fold is NOT sacred:
+the contract is that every path the engine runs — the fused chunk and the split
+decode/verify — performs the same arithmetic in the same order for a given row, not
+that it performs today's. A new fold (a different leaf grain, block grain, warp layout,
+or a new structure altogether) is admissible if every path shares it and the tests are
+green; the chunk may have its own kernel instantiation (its own row tile, its own
+pipeline) as long as the per-row arithmetic is the fold's.
+
+Only gemma_attn.py may change (you may add helper modules it imports). shapes.py,
+data.py, reference.py, test_attn.py and bench.py are read-only. No torch attention /
+matmul / softmax on the main path and no torch.compile. The engine replays this call
+under CUDA graphs at decode and verify: a plain launch (or a fixed short sequence of
+launches) with no host sync, no data-dependent host work (the metadata is read on
+device — `qo_indptr` and friends are device int32 tensors rewritten between replays;
+only shapes, `window_left` and the row count are static), no runtime autotuning —
+constants chosen statically (a rule on the row count is fine), measured, then fixed.
+Per-call workspace allocations through torch are fine; shape-keyed caches are not (the
+prefill row count varies chunk to chunk).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `chunk_score` (lower is
+better): the geometric mean over the three SCORED cells — the global kind's 4096-row
+chunk at kv 8192, 32768 and 61440 (a 65k prompt's chunk 1, mean chunk and last full
+chunk) — of median per-call µs over the starting kernel's, multiplied by the geometric
+mean over the nine HELD cells (sliding decode / verify / chunk at 32k; global decode and
+verify at 4k / 32k / 128k) of max(1.0, µs over the start's). The start scores 1.0. A
+held cell cannot lower the score; a slower held cell raises it, so winning the chunk by
+losing decode does not win. `--quick` runs the three scored cells only (~10 s); the
+full bench is ~1 min. Each cell rotates its inputs over sets exceeding 4x L2, so the
+figure is cold. Noise on the scored cells is ~1% run to run; A/B anything under 3%.
+
+The start's scored cells: 25.7 / 128.3 / 250.7 ms. Their FLOP floors at 126 TFLOPS
+(4 · 16 heads · 512 · causal pairs): 6.5 / 32.7 / 63.3 ms — a score of 0.25 is the
+peak, 0.51 is half the peak. The wheel's own head_dim-512 chunk template runs these at
+22.7 / 122.8 / 236.7 ms, ~35 TFLOPS: it is not the floor and not the target; it is
+printed beside each cell for the record and enters nothing.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass (45 pass, 7 skip — the span
+arms on the global kind — ~5 s on the start). Invariance is BITWISE on every arm;
+correctness is within twice the wheel's rel-L2 from fp32; the image-span contract on the
+sliding kind; determinism over 8 calls; CUDA-graph capture and replay at rows 1 and 4
+with the metadata rewritten between replays; no torch attention op on the path. Do not
+edit the tests; a candidate that needs them changed is wrong. Run validate after EVERY
+change to the fold, however small: the previous loop on this kernel found a warp-layout
+change moves one element in 25k by an ulp, and its own hand-written bitwise probe
+reported EQUAL on every broken variant — only the suite's volume caught them.
+"""
+hints = """
+What has been measured on this box and on this kernel, and what the invariant forbids.
+Each hint is a claim that was true of the kernel it was measured on; a hint owed its
+probe on yours before it is believed.
+
+- Where the start spends the chunk, from its own _CFG for (1, 512): the fused path
+  tiles 2 rows x 16 heads = M 32 per program, walks the whole context in 32-key leaves
+  (every `tl.dot` is [32, 512] x [512, 32] then [32, 32] x [32, 512]), and holds `acc`
+  [32, 512] fp32 = 64 KB in registers. At 4096 rows that is 2048 programs per layer,
+  each streaming every key before its tile — the chunk re-reads K and V ~2048 times
+  (L2 serves most of it: 60k context is 126 MB of K/V against a 24 MiB L2) and runs
+  tiny mma shapes. The previous loop's note on this geometry: `rows_tile` 1 vs 2 traded
+  14 µs at decode against a 4-row verify becoming four tiles; it never tried a wide
+  chunk tile on the global kind because `acc` [BM, 512] fp32 caps BM at the register
+  file — exp_006 hit OutOfResources at q [64, 512] bf16 (64 KB of the 99 KB smem) with
+  DSPLIT on the split path. The question the loop is funded to answer: what tile shape
+  and fold grain let the global chunk run near the dense-attention rate of this part
+  at head_dim 512, within 99 KB of shared memory and a 64K-register file per SM, while
+  decode and verify still split the same fold across programs at their price?
+
+- The fold's membership, as measured on THIS kernel by the previous loop (KOPT-NOTES,
+  sparkle docs/history/archive/next120): LEAF, BLOCK and `num_warps` are in the fold
+  (shared by the fused and split paths: a different warp layout moved the mma's
+  reduction order by an ulp in 1 of 25k elements on the sliding kind); `num_stages` is
+  NOT in the fold on the global kind (exp_011, measured) and IS on the sliding kind;
+  the row tile, the split factor DSPLIT and the reduce's column tile DCHUNK are not.
+  So a new LEAF or BLOCK for the global kind changes the split path's tile too — the
+  decode and verify cells are there to price that. A uniform branch over fully covered
+  leaves (skipping the mask where no key is masked) moved an element (exp_007): the
+  masked and unmasked leaf must take the same arithmetic path.
+
+- The arithmetic that is exact by construction (sparkle next.75's probes, on this part):
+  (1) `dot(P, V, acc=C) != dot(P, V) + C` — the mma's accumulate is not an IEEE fp32
+  add, in ~50% of elements, so a fold threaded through the mma's C operand at one end
+  cannot be reproduced by merging partials at the other; (2) the zero-start
+  `dot(P, V, acc=0) == dot(P, V)` is exact; (3) a max is exactly associative, a sum is
+  not; (4) rows of a tile do not interact in the mma, so a row may ride a padded tile
+  without a class of its own — provided the fold is the same. A fully masked leaf
+  must be an exact no-op; the start's finite `m_i` init (-3e38) is how it gets one.
+  The split-invariant two-level fold (a zero-start partial per absolute BLOCK, a left
+  fold over blocks through `_combine` in ordinary fp32) is one shape that lets the
+  chunk fold in registers while decode splits across programs; it is the start's, not
+  the only one. Splitting the OUTPUT columns (V's D) across programs with the scores
+  recomputed per program is exact by construction — `m` and `l` do not depend on which
+  columns a program owns — and is what the split path's DSPLIT does; whether the fused
+  path can afford to recompute QK per column half is a measurement.
+
+- The sliding kind's chunk (1569 µs, 1.38x the wheel) is a HELD cell, not a scored one:
+  it is 40 layers x 1.5 ms = 62 ms of a chunk against the global kind's 8 x 32-250 ms.
+  Do not spend iterations on it. Its key index space is the GATHER (`pos_base + j`),
+  and its image-span mask rides in `_tile_geometry` as a per-row `reach`; a change to
+  the shared helpers is gated by the span tests.
+
+- The part: 48 SMs, sm_121, 24 MiB L2, ~237-250 GB/s practical read, 126 TFLOPS dense
+  bf16 (measured, the dense rung; the 213 figure in circulation is the sparse one).
+  99 KB shared memory per CTA; `torch.cuda.get_device_properties()` before choosing
+  constants. A 32-key K+V leaf at head_dim 512 is 64 KB of shared memory; count before
+  you size. FlashInfer runs two CTAs per SM. Triton on this part: `tl.dot` with bf16
+  operands and fp32 accumulate; `num_stages` buys a pipelined key loop only when the
+  tile leaves room for it.
+
+- A candidate landing on a measured ceiling is a reason to re-derive what the ceiling
+  assumed (one launch at a time, steady state, one program per SM), not to stop. The
+  previous loop on this kernel measured a ceiling in iteration 2, read four iterations
+  of results against it as exhausted, and went under it in iteration 8.
+
+- Measure cold, A/B anything under 3%, one change per iteration, log the negatives:
+  a per-cell probe win that does not survive the whole bench is the norm, not the
+  exception, on this box.
+"""
+
+[task.repo]
+path = "../examples/gemma-attn-chunk"
+
+[task.hardware]
+gpus = 1
+gpu = "NVIDIA GB10 (DGX Spark, sm_121, unified memory, ~237 GB/s practical read, 48 SMs, 24 MiB L2, 99 KB smem per CTA)"
